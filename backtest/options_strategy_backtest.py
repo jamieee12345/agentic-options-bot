@@ -124,8 +124,19 @@ def run_symbol_backtest(
     open_trade: Optional[SimulatedTrade] = None
     just_closed_this_bar = False
 
+    # Bounded window (400 bars ~ orchestration/run_live.py's DAILY_LOOKBACK_DAYS),
+    # not the full history-to-date -- two reasons, not just speed. (1) The
+    # unbounded `bars.iloc[:i+1]` made every bar's confluence computation
+    # O(window size), so the whole backtest was O(n^2) in the number of
+    # bars -- a 20-symbol/5-year run took 40+ minutes for exactly this
+    # reason. (2) More importantly, an unbounded window is NOT what the
+    # live bot ever sees: run_live.py always fetches a capped lookback
+    # (400 daily bars), so testing against ever-growing history was
+    # already a live/backtest fidelity gap, independent of speed -- this
+    # fix corrects both at once, not just the slow one.
+    WINDOW_BARS = 400
     for i in range(warmup_bars, len(bars)):
-        window = bars.iloc[: i + 1]
+        window = bars.iloc[max(0, i + 1 - WINDOW_BARS): i + 1]
         current_date = bars.index[i].date() if hasattr(bars.index[i], "date") else bars.index[i]
         spot = float(bars["close"].iloc[i])
         result.bars_evaluated += 1
