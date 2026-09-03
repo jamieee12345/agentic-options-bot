@@ -232,8 +232,8 @@ class AlpacaIntradayHistoricalFetcher(HistoricalDataFetcher):
     data access doesn't require funding a brokerage account with them, only
     signing up. Set in your local, git-ignored .env (never as literals here,
     never pasted anywhere else):
-        ALPACA_API_KEY_ID=PKLDJGK44XJJVSUH7QZRWXNYLH
-        ALPACA_API_SECRET_KEY=BjDby4SzwFp5Gw6g3VUjerotmxLTGLhpw2uQ8jSpbh56
+        ALPACA_API_KEY_ID=<your key id, starts with PK>
+        ALPACA_API_SECRET_KEY=<your secret key>
 
     Meaningfully more verified than this project's robin_stocks/options
     integrations: `alpaca-py` was actually installed in this environment
