@@ -116,25 +116,39 @@ options:
   # (config_loader.py) and again at the point of contract selection
   # (data/options_data.py's MIN_ALLOWED_DTE), independently, on purpose.
   #
-  # Shifted from 30-45 (monthly) to weekly-range contracts, on request:
-  # this account trades off a 5-minute intraday signal, and a 30-45 day
-  # contract is a real mismatch for that -- you'd be paying for a month of
-  # time value to capture a move the strategy expects to resolve in days,
-  # not weeks. target_dte_min is 2, not 1: literal 1DTE leaves zero room
-  # for ANY close_before_expiration_days buffer (there's no positive
-  # integer smaller than 1), so 2 is the closest value that still respects
-  # the 0DTE floor while leaving one full day of buffer below.
-  target_dte_min: 2
-  target_dte_max: 7
+  # Narrowed to 1-2 DTE on request, moving this from a multi-day swing
+  # strategy to same-day/single-overnight only -- see max_hold_days below,
+  # which is the actual mechanism enforcing "never held past one
+  # overnight." target_dte_min=1 is now usable (it wasn't before) because
+  # close_before_expiration_days dropped to 0 at the same time -- see that
+  # field's comment for why the two changed together.
+  target_dte_min: 1
+  target_dte_max: 2
 
-  # Force-close any open options position within this many days of
-  # expiration, regardless of what the FVG signal wants that bar. Must be
-  # < target_dte_min, so a freshly opened position is never already inside
-  # its own force-close window. 1 (not the original 5) to fit inside the
-  # new 2-7 day window -- a position now only ever gets one day of runway
-  # before being forced out, which is the tightest this can go given
-  # target_dte_min=2.
-  close_before_expiration_days: 1
+  # Force-close any open options position once it's ON its expiration day
+  # (0 = same-day, not "1 day before" as it was under the old 2-7 DTE
+  # window). This is now the LAST-RESORT backstop, not the primary time
+  # exit -- max_hold_days below fires first in the overwhelming majority
+  # of cases. 0 had to be allowed (config_loader.py's validation used to
+  # require a positive value) specifically so target_dte_min=1 stays
+  # usable: with the old requirement (close_before_expiration_days <
+  # target_dte_min, strictly positive), a 1-DTE floor had no valid value
+  # to put here at all -- 0 < 1 is the only way both hold at once.
+  close_before_expiration_days: 0
+
+  # THE actual mechanism for "same-day and overnight-swing trades only":
+  # force-close any position once it's been open this many CALENDAR days,
+  # regardless of DTE-at-entry, P&L, or what the FVG signal wants.
+  # Checked first, before every other exit rule (including expiration).
+  # 1 = a position opened today can run through the rest of today, and
+  # gets force-closed the first cycle it's still open on a LATER calendar
+  # day -- i.e. at most one overnight hold, never two. Combined with
+  # target_dte_min=1/target_dte_max=2 above, no position can ever reach
+  # actual same-day expiration risk under normal operation; the amount of
+  # theta decay this strategy can be exposed to before being forced out is
+  # now tightly bounded, which was the whole point of narrowing the DTE
+  # window in the first place.
+  max_hold_days: 1
 
   # Raised from 0.5%/5% (tuned for a much larger account) to 20%/30%, on
   # request: at $1,000 equity, 0.5% is a $5 budget, which never clears

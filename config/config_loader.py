@@ -167,6 +167,16 @@ class OptionsConfig:
     # instead of being cut once they'd already shown they weren't working.
     stagnant_exit_hold_fraction: float
     stagnant_exit_min_pnl_pct: float
+    # Hard cap on TOTAL holding time, independent of DTE-at-entry or P&L --
+    # checked first, before every other exit rule. Unlike stagnant_exit_*
+    # (a conditional, fraction-of-DTE check), this is unconditional: once a
+    # position has been open for max_hold_days calendar days, it force-
+    # closes no matter what. Added alongside a much tighter DTE window
+    # (target_dte_min=1) specifically to restrict this strategy to same-day
+    # and single-overnight trades only -- 1 means "close by the end of the
+    # day after it was opened," which combined with target_dte_max=2 means
+    # no position is ever held longer than one overnight swing.
+    max_hold_days: int
 
     def __post_init__(self) -> None:
         if self.target_dte_min < MIN_ALLOWED_DTE:
@@ -178,8 +188,8 @@ class OptionsConfig:
             raise ConfigError(
                 f"options.target_dte_min ({self.target_dte_min}) must be < target_dte_max ({self.target_dte_max})"
             )
-        if self.close_before_expiration_days <= 0:
-            raise ConfigError(f"options.close_before_expiration_days ({self.close_before_expiration_days}) must be positive")
+        if self.close_before_expiration_days < 0:
+            raise ConfigError(f"options.close_before_expiration_days ({self.close_before_expiration_days}) must be non-negative")
         if self.close_before_expiration_days >= self.target_dte_min:
             raise ConfigError(
                 f"options.close_before_expiration_days ({self.close_before_expiration_days}) must be < "
@@ -222,6 +232,8 @@ class OptionsConfig:
                 f"can never actually trigger as currently configured.",
                 stacklevel=2,
             )
+        if self.max_hold_days <= 0:
+            raise ConfigError(f"options.max_hold_days ({self.max_hold_days}) must be positive")
 
 
 @dataclass(frozen=True)

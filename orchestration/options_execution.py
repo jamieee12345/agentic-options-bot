@@ -26,34 +26,42 @@ or the portfolio premium cap against a position that hasn't settled yet.
 
 No assignment-risk handling needed here (that's specific to being SHORT an
 option -- covered calls, cash-secured puts, naked writes -- none of which
-this does). Five things this DOES manage for an existing position, checked
+this does). Six things this DOES manage for an existing position, checked
 BEFORE the signal, in this order:
-  1. Expiration (`close_before_expiration_days`) -- forces a close well
-     before automatic exercise or the position evaporating to zero on the
-     last day.
-  2. FVG invalidation -- structural stop, not a dollar one: has price
+  1. Max hold (`max_hold_days`) -- unconditional, checked FIRST: once a
+     position has been open this many calendar days, force-close it no
+     matter what, regardless of DTE-at-entry, P&L, or the FVG signal. This
+     is what actually enforces "same-day and single-overnight trades
+     only" (target_dte_min=1/target_dte_max=2) -- narrowed from a
+     multi-day swing window on request, specifically to bound how much
+     theta decay any position can ever be exposed to.
+  2. Expiration (`close_before_expiration_days`) -- now a LAST-RESORT
+     backstop (0 = force-close once actually on the expiration day
+     itself), since #1 fires first in the overwhelming majority of cases
+     given the narrow 1-2 DTE window.
+  3. FVG invalidation -- structural stop, not a dollar one: has price
      closed back through the ENTIRE gap that triggered this trade? If so
      the premise is gone regardless of what the option's current value
      says. Needs the triggering gap's bounds, persisted at open time via
      orchestration/trade_log.py (survives the bot stopping overnight).
-  3. Stop-loss (`stop_loss_pct`) -- the dollar backstop underneath #2:
+  4. Stop-loss (`stop_loss_pct`) -- the dollar backstop underneath #3:
      force-close once current value has fallen this fraction below entry,
      independent of any structural read. Catches gap risk / cases the FVG
-     check doesn't -- both #2 and #3 exist because either can fire first.
-  4. Take-profit (`take_profit_pct`) -- lock in a gain rather than ride it
+     check doesn't -- both #3 and #4 exist because either can fire first.
+  5. Take-profit (`take_profit_pct`) -- lock in a gain rather than ride it
      indefinitely. Nothing in this system confirms a move will CONTINUE
      once it's already worked -- confluence only validates entries, not
      continuation -- so an open-ended hold on a winner has no more
      informational backing than one on a loser.
-  5. Stagnation (`stagnant_exit_hold_fraction`/`stagnant_exit_min_pnl_pct`)
-     -- "close if going nowhere": only reachable if #3/#4 didn't already
+  6. Stagnation (`stagnant_exit_hold_fraction`/`stagnant_exit_min_pnl_pct`)
+     -- "close if going nowhere": only reachable if #4/#5 didn't already
      fire, so this only affects a position in the boring middle. Once held
      for `stagnant_exit_hold_fraction` of its own dte_at_entry without
      reaching `stagnant_exit_min_pnl_pct`, force-close rather than let it
-     ride the back half of its life -- where theta decay accelerates
-     fastest -- toward an expiration close. Added after a diagnostic
-     backtest showed expiration closes were this strategy's single largest
-     loss bucket by trade count.
+     ride toward an expiration close. Still meaningfully tighter than #1
+     for a 1-DTE position specifically (0.5 * 1 day = 12h vs. max_hold_days'
+     24h) -- for a 2-DTE position the two thresholds coincide (0.5 * 2 = 1
+     day), so #1 wins the race there since it's unconditional.
 """
 from __future__ import annotations
 
@@ -192,6 +200,7 @@ class OptionsOrderExecutor:
         take_profit_pct: float,
         stagnant_exit_hold_fraction: float,
         stagnant_exit_min_pnl_pct: float,
+        max_hold_days: int,
         live_trading_enabled: bool = False,
         duplicate_guard: Optional[DuplicateOrderGuard] = None,
         trade_log_path: Path = DEFAULT_LOG_PATH,
@@ -230,6 +239,9 @@ class OptionsOrderExecutor:
         # both failed to fire this bar (see _check_price_based_exit).
         self.stagnant_exit_hold_fraction = stagnant_exit_hold_fraction
         self.stagnant_exit_min_pnl_pct = stagnant_exit_min_pnl_pct
+        # Unconditional holding-time cap, checked FIRST in run() -- see
+        # class/module docstrings. Independent of DTE-at-entry and P&L.
+        self.max_hold_days = max_hold_days
         self.live_trading_enabled = live_trading_enabled
         self.duplicate_guard = duplicate_guard or DuplicateOrderGuard()
         self.trade_log_path = trade_log_path
@@ -277,6 +289,21 @@ class OptionsOrderExecutor:
             current_price = float(symbol_bars["close"].iloc[-1])
 
             if existing is not None:
+                open_trade = open_trade_by_symbol.get(symbol)
+                if open_trade is not None:
+                    try:
+                        opened_at = datetime.fromisoformat(open_trade.opened_at)
+                    except (TypeError, ValueError):
+                        opened_at = None
+                    if opened_at is not None and (now.date() - opened_at.date()).days >= self.max_hold_days:
+                        records.append(self._close(
+                            symbol, existing, now, open_order_symbols,
+                            f"max_hold: held since {opened_at.date().isoformat()}, {self.max_hold_days}d cap reached -- "
+                            f"same-day/overnight-only strategy, forced close regardless of DTE or P&L",
+                            open_position_quotes,
+                        ))
+                        continue
+
                 if (existing.expiration_date - now.date()).days <= self.close_before_expiration_days:
                     records.append(self._close(symbol, existing, now, open_order_symbols, "approaching expiration -- forced close", open_position_quotes))
                     continue

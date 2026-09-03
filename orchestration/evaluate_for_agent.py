@@ -122,6 +122,7 @@ def _build_executor(settings) -> OptionsOrderExecutor:
         take_profit_pct=opt.take_profit_pct,
         stagnant_exit_hold_fraction=opt.stagnant_exit_hold_fraction,
         stagnant_exit_min_pnl_pct=opt.stagnant_exit_min_pnl_pct,
+        max_hold_days=opt.max_hold_days,
         live_trading_enabled=settings.broker.live_trading_enabled,
     )
 

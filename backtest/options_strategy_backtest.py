@@ -28,6 +28,22 @@ READ THIS BEFORE TRUSTING ANY NUMBER THIS PRODUCES:
    the same as it would be live. This is the one thing this backtest DOES
    get right with confidence.
 
+5. **Cannot distinguish same-day exits from overnight ones, at all** --
+   this backtest is DAILY-bar-only (see `run_backtest`'s
+   `timeframe="1D"` fetch), one confluence evaluation per calendar day.
+   The live strategy (max_hold_days, target_dte_min=1/target_dte_max=2 in
+   settings.yaml) is explicitly built around same-day and single-overnight
+   holds -- something with no representation at daily granularity. Every
+   simulated trade here effectively spans "opened day i, force-closed on
+   day i+1" (max_hold_days=1 triggers on the very next daily bar,
+   regardless of whether the real position would have been closed same-
+   day by the FVG signal, or held overnight), so this backtest cannot
+   meaningfully validate the same-day-vs-overnight split at all -- only
+   real dry-run cycles against real intraday data (the MCP routine, or
+   run_live.py's own intraday bars) can do that. Treat any number from
+   this file for this strategy shape as even rougher than caveat 2 already
+   implies.
+
 What this IS good for: catching bugs in the decision logic (crashes, dumb
 outputs, a threshold that never triggers or always triggers), sanity-
 checking how selective the confluence gate actually is in practice, and a
@@ -141,6 +157,19 @@ def run_symbol_backtest(
         spot = float(bars["close"].iloc[i])
         result.bars_evaluated += 1
         just_closed_this_bar = False
+
+        # Unconditional holding-time cap, checked FIRST -- matches
+        # orchestration/options_execution.py's ordering. See this module's
+        # docstring (caveat 5) for why daily-bar granularity can't actually
+        # distinguish a same-day exit from an overnight one: this will
+        # almost always be what closes a trade, on the very next bar.
+        if open_trade is not None:
+            days_held = (current_date - open_trade.entry_date).days
+            if days_held >= opt.max_hold_days:
+                open_trade.exit_date, open_trade.exit_reason = current_date, "max_hold"
+                open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                result.trades.append(open_trade)
+                open_trade, just_closed_this_bar = None, True
 
         if open_trade is not None:
             days_left = (open_trade.expiration_date - current_date).days
