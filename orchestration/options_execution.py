@@ -57,7 +57,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from brain.options_strategy import OptionsDecision, decide_options_action
-from data.options_data import RobinhoodOptionChainFetcher
+from data.options_data import OptionContract, RobinhoodOptionChainFetcher
 from orchestration.activity_log import ActivityEntry
 from orchestration.activity_log import DEFAULT_LOG_PATH as DEFAULT_ACTIVITY_LOG_PATH
 from orchestration.activity_log import append_entry as append_activity_entry
@@ -126,13 +126,48 @@ class OptionsExecutionRecord:
     confluence_details: Dict[str, str] = field(default_factory=dict)
     confluence_score: Optional[float] = None
     confluence_applicable: int = 0
+    # Set only in AGENT MODE (chain_fetcher=None, see OptionsOrderExecutor's
+    # docstring) for a close or open-signal this run() couldn't fully resolve
+    # itself -- no broker/chain_fetcher means it can't fetch a contract, fetch
+    # a fresh quote, or place an order, so it hands back exactly what a
+    # caller (a Claude agent driving Robinhood's MCP tools) needs to finish
+    # the job: for a close, the known contract + a limit price (already
+    # resolved from a supplied quote); for an open, only a direction/
+    # conviction -- the agent must still pick a contract via MCP and run a
+    # separate size-check before anything can be priced or sized. Never
+    # combined with placed=True -- agent-mode never places an order itself.
+    pending_action: Optional[Dict] = None
 
 
 class OptionsOrderExecutor:
+    """Two modes, selected purely by whether `chain_fetcher` is given:
+
+    BROKER MODE (chain_fetcher set, the original/default behavior, still
+    used by orchestration/run_live.py) -- this class does everything itself:
+    fetches contracts and quotes via chain_fetcher, places orders via
+    `broker.place_option_order` when live_trading_enabled, and writes
+    trade_log.jsonl immediately as each decision is made.
+
+    AGENT MODE (chain_fetcher=None, broker=None) -- for the Robinhood MCP
+    migration (see the plan this was built from): this class can't reach
+    the broker or fetch its own contracts/quotes, so it never calls
+    place_option_order and never writes trade_log.jsonl itself. Instead it
+    returns `OptionsExecutionRecord.pending_action` for anything that would
+    need a broker call, and the CALLER (orchestration/evaluate_for_agent.py,
+    driven by a Claude agent with the Robinhood MCP tools) finishes the job:
+    fetching contracts/quotes via MCP, sizing/validating via this same
+    module's compute_contract_count/run_order_checks, calling
+    review_option_order/place_option_order itself, and recording the result
+    to trade_log.jsonl via evaluate_for_agent.py's own `record` mode. This
+    keeps every safety number (spread cap, sizing caps, DTE window, the
+    confluence gate) in this exact tested code either way -- only WHO makes
+    the final broker call changes between modes.
+    """
+
     def __init__(
         self,
         broker,
-        chain_fetcher: RobinhoodOptionChainFetcher,
+        chain_fetcher: Optional[RobinhoodOptionChainFetcher],
         max_premium_pct_per_trade: float,
         max_total_premium_pct_of_equity: float,
         close_before_expiration_days: int,
@@ -153,6 +188,7 @@ class OptionsOrderExecutor:
     ) -> None:
         self.broker = broker
         self.chain_fetcher = chain_fetcher
+        self._agent_mode = chain_fetcher is None  # see class docstring
         self.max_premium_pct_per_trade = max_premium_pct_per_trade
         self.max_total_premium_pct_of_equity = max_total_premium_pct_of_equity
         self.close_before_expiration_days = close_before_expiration_days
@@ -192,12 +228,24 @@ class OptionsOrderExecutor:
         open_order_symbols: List[str],
         now: datetime,
         daily_bars: Optional[Dict[str, pd.DataFrame]] = None,
+        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
     ) -> List[OptionsExecutionRecord]:
         """`bars` drives FVG/structure/S-R/etc -- pass intraday bars here for
         live trading so the strategy reacts within the trading day, not just
         once it closes. `daily_bars`, if given, is used only for the 200-SMA
         trend veto per symbol (see brain/confluence.py's docstring for why
         that stays on a daily interval regardless of what `bars` is).
+
+        `open_position_quotes` is AGENT MODE ONLY (ignored in broker mode,
+        which fetches its own quotes via chain_fetcher): a fresh quote per
+        symbol with an existing open position, keyed by symbol -- the caller
+        (an agent with the Robinhood MCP tools) fetches these once up front
+        via get_option_quotes, since this class has no chain_fetcher to do
+        it itself in agent mode. Needed for the stop-loss/take-profit check
+        and for pricing a close's limit price. A symbol with an open
+        position but no entry here just skips that symbol's price-based
+        exit check this cycle (fails open, same as a failed quote fetch
+        does in broker mode) rather than erroring.
         """
         current_total_premium_at_risk = sum(p.quantity * p.average_premium_paid * 100 for p in open_positions.values())
         records: List[OptionsExecutionRecord] = []
@@ -214,15 +262,17 @@ class OptionsOrderExecutor:
 
             if existing is not None:
                 if (existing.expiration_date - now.date()).days <= self.close_before_expiration_days:
-                    records.append(self._close(symbol, existing, now, open_order_symbols, "approaching expiration -- forced close"))
+                    records.append(self._close(symbol, existing, now, open_order_symbols, "approaching expiration -- forced close", open_position_quotes))
                     continue
 
-                fvg_record = self._check_fvg_invalidation(symbol, existing, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols)
+                fvg_record = self._check_fvg_invalidation(
+                    symbol, existing, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes,
+                )
                 if fvg_record is not None:
                     records.append(fvg_record)
                     continue
 
-                price_exit_record = self._check_price_based_exit(symbol, existing, now, open_order_symbols)
+                price_exit_record = self._check_price_based_exit(symbol, existing, now, open_order_symbols, open_position_quotes)
                 if price_exit_record is not None:
                     records.append(price_exit_record)
                     continue
@@ -252,7 +302,7 @@ class OptionsOrderExecutor:
 
             if decision.action == "close":
                 if existing is not None:
-                    records.append(self._close(symbol, existing, now, open_order_symbols, decision.reasoning))
+                    records.append(self._close(symbol, existing, now, open_order_symbols, decision.reasoning, open_position_quotes))
                 else:
                     records.append(OptionsExecutionRecord(
                         symbol, None, None, None, False, None, f"nothing open -- {decision.reasoning}", **decision_fields,
@@ -262,7 +312,9 @@ class OptionsOrderExecutor:
             wanted_type = "call" if decision.action == "buy_call" else "put"
 
             if existing is not None and existing.option_type != wanted_type:
-                records.append(self._close(symbol, existing, now, open_order_symbols, f"flipping {existing.option_type}->{wanted_type}: {decision.reasoning}"))
+                records.append(self._close(
+                    symbol, existing, now, open_order_symbols, f"flipping {existing.option_type}->{wanted_type}: {decision.reasoning}", open_position_quotes,
+                ))
                 continue
 
             if existing is not None and existing.option_type == wanted_type:
@@ -272,7 +324,23 @@ class OptionsOrderExecutor:
                 ))
                 continue
 
-            records.append(self._open(symbol, current_price, wanted_type, decision, equity, current_total_premium_at_risk, buying_power, now, open_order_symbols))
+            if self._agent_mode:
+                # No chain_fetcher to pick a contract with -- the caller
+                # (an agent with the Robinhood MCP tools) must fetch a
+                # chain/instrument/quote itself, then run this module's
+                # compute_contract_count/run_order_checks (via
+                # evaluate_for_agent.py's size_check mode) before anything
+                # here can be priced, sized, or placed.
+                records.append(OptionsExecutionRecord(
+                    symbol, None, wanted_type, None, False, None, f"awaiting agent execution -- {decision.reasoning}",
+                    pending_action={
+                        "type": "open", "wanted_type": wanted_type, "conviction": decision.conviction,
+                        "gap_low": decision.gap_low, "gap_high": decision.gap_high, "reasoning": decision.reasoning,
+                    },
+                    **decision_fields,
+                ))
+            else:
+                records.append(self._open(symbol, current_price, wanted_type, decision, equity, current_total_premium_at_risk, buying_power, now, open_order_symbols))
 
         # One pass, logged after the loop rather than at each individual
         # records.append() call above -- simpler to keep correct than
@@ -293,6 +361,7 @@ class OptionsOrderExecutor:
 
     def _check_fvg_invalidation(
         self, symbol, existing: OpenOptionPosition, current_price: float, open_trade, now, open_order_symbols,
+        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
     ) -> Optional[OptionsExecutionRecord]:
         """Structural stop: has price closed back through the ENTIRE Fair
         Value Gap that triggered this position? If so the setup's premise
@@ -316,30 +385,44 @@ class OptionsOrderExecutor:
             return self._close(
                 symbol, existing, now, open_order_symbols,
                 f"fvg_invalidated: price ({current_price:.2f}) closed below the entry gap's low (${open_trade.gap_low:.2f}) -- bullish setup filled and broken",
+                open_position_quotes,
             )
         if existing.option_type == "put" and current_price > open_trade.gap_high:
             return self._close(
                 symbol, existing, now, open_order_symbols,
                 f"fvg_invalidated: price ({current_price:.2f}) closed above the entry gap's high (${open_trade.gap_high:.2f}) -- bearish setup filled and broken",
+                open_position_quotes,
             )
         return None
 
-    def _check_price_based_exit(self, symbol, existing: OpenOptionPosition, now, open_order_symbols) -> Optional[OptionsExecutionRecord]:
-        """Stop-loss and take-profit together, from one quote fetch --
-        checked every bar an existing position isn't already being closed
-        for expiration or FVG invalidation. Needs a fresh quote regardless
-        of what the FVG/confluence signal says this bar -- monitoring an
-        open long option's current value is a bar-by-bar obligation, not
+    def _check_price_based_exit(
+        self, symbol, existing: OpenOptionPosition, now, open_order_symbols,
+        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
+    ) -> Optional[OptionsExecutionRecord]:
+        """Stop-loss and take-profit together, from one quote -- checked
+        every bar an existing position isn't already being closed for
+        expiration or FVG invalidation. Needs a fresh quote regardless of
+        what the FVG/confluence signal says this bar -- monitoring an open
+        long option's current value is a bar-by-bar obligation, not
         something that can wait for a new signal to show up.
+
+        Broker mode fetches that quote itself via chain_fetcher; agent mode
+        has no chain_fetcher, so it reads from the caller-supplied
+        `open_position_quotes` instead (see run()'s docstring) -- a missing
+        entry there is treated the same as a failed fetch in broker mode:
+        fail open, skip the check this cycle, don't error.
         """
         if existing.average_premium_paid <= 0:
             return None  # no known entry cost to measure P&L against (e.g. adapter couldn't read average_price) -- fail open rather than close on bad data
 
-        quote = self.chain_fetcher.get_quote_for_known_contract(
-            symbol, existing.option_type, existing.expiration_date, existing.strike_price,
-        )
+        if self._agent_mode:
+            quote = (open_position_quotes or {}).get(symbol)
+        else:
+            quote = self.chain_fetcher.get_quote_for_known_contract(
+                symbol, existing.option_type, existing.expiration_date, existing.strike_price,
+            )
         if quote is None or quote.mid_price is None:
-            logger.warning("%s: could not fetch a fresh quote for the stop-loss/take-profit check this bar -- skipping", symbol)
+            logger.warning("%s: no fresh quote available for the stop-loss/take-profit check this bar -- skipping", symbol)
             return None
 
         current_value = quote.mid_price * existing.quantity * 100
@@ -350,15 +433,20 @@ class OptionsOrderExecutor:
             return self._close(
                 symbol, existing, now, open_order_symbols,
                 f"stop_loss: down {-pnl_pct:.0%} from entry (${entry_value:.2f} -> ${current_value:.2f}), limit is {self.stop_loss_pct:.0%}",
+                open_position_quotes,
             )
         if pnl_pct >= self.take_profit_pct:
             return self._close(
                 symbol, existing, now, open_order_symbols,
                 f"take_profit: up {pnl_pct:.0%} from entry (${entry_value:.2f} -> ${current_value:.2f}), target is {self.take_profit_pct:.0%}",
+                open_position_quotes,
             )
         return None
 
-    def _close(self, symbol, existing: OpenOptionPosition, now, open_order_symbols, reason) -> OptionsExecutionRecord:
+    def _close(
+        self, symbol, existing: OpenOptionPosition, now, open_order_symbols, reason,
+        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
+    ) -> OptionsExecutionRecord:
         check = self.duplicate_guard.check(symbol, now, open_order_symbols)
         if not check.ok:
             return OptionsExecutionRecord(symbol, "close", existing.option_type, existing.quantity, False, None, check.reason)
@@ -368,18 +456,41 @@ class OptionsOrderExecutor:
         # Fetched before the live/dry-run branch below so the trade log gets
         # a real estimated exit notional either way -- a dry-run entry with
         # no price attached would be far less useful for judging the
-        # strategy's behavior before it's trusted with real orders.
-        quote = self.chain_fetcher.get_quote_for_known_contract(
-            symbol, existing.option_type, existing.expiration_date, existing.strike_price,
-        )
+        # strategy's behavior before it's trusted with real orders. Agent
+        # mode has no chain_fetcher, so it uses the caller-supplied quote
+        # (see run()'s docstring) instead of fetching its own.
+        if self._agent_mode:
+            quote = (open_position_quotes or {}).get(symbol)
+        else:
+            quote = self.chain_fetcher.get_quote_for_known_contract(
+                symbol, existing.option_type, existing.expiration_date, existing.strike_price,
+            )
         limit_price = quote.mid_price if quote is not None else None
         if not limit_price or limit_price <= 0:
             return OptionsExecutionRecord(
                 symbol, "close", existing.option_type, existing.quantity, False, None,
-                "could not get a fresh quote to close this position -- refusing to submit a close order with no limit price",
+                "no usable quote to close this position -- refusing to submit a close order with no limit price",
             )
 
         exit_notional = limit_price * existing.quantity * 100
+
+        if self._agent_mode:
+            # Can't place the order or write trade_log.jsonl here -- no
+            # broker, and the REAL outcome (was it actually filled? what
+            # order_id?) isn't known until the caller (an agent) executes
+            # this via the Robinhood MCP tools and reports back through
+            # evaluate_for_agent.py's `record` mode. Everything the agent
+            # needs to do that is in pending_action.
+            return OptionsExecutionRecord(
+                symbol, "close", existing.option_type, existing.quantity, False, None, None,
+                pending_action={
+                    "type": "close", "option_type": existing.option_type,
+                    "expiration_date": existing.expiration_date.isoformat(), "strike_price": existing.strike_price,
+                    "side": "sell", "position_effect": "close", "quantity": existing.quantity,
+                    "limit_price": limit_price, "notional": exit_notional, "reason": reason,
+                },
+            )
+
         order_id = None
         if self.live_trading_enabled:
             order_id = self.broker.place_option_order(
