@@ -3,8 +3,12 @@ plan this was built from). A Claude Code scheduled routine, holding the
 Robinhood MCP tools, is the only thing that can actually read the account or
 place an order under the sanctioned "Agentic Trading" path -- this script
 supplies the DECISION, never the execution. It never imports robin_stocks
-and never touches the network for a broker call; the only outbound call
-here is Alpaca market data (unchanged from orchestration/run_live.py).
+and makes no network call of its own at all -- bars, account state, and
+quotes all arrive via stdin JSON, already fetched by the agent through
+Robinhood MCP's get_equity_historicals/get_equity_quotes. This is why
+Alpaca (which needed an API key with nowhere safe to store it in a
+routine's sandbox) was dropped in favor of the data source the agent
+already has authorized access to.
 
 Three subcommands, matching the three points in a cycle where the routine
 needs a verdict from tested Python instead of its own judgment:
@@ -56,7 +60,6 @@ from typing import Dict, Optional
 import pandas as pd
 
 from config.config_loader import load_settings
-from data.fetchers import AlpacaIntradayHistoricalFetcher, YFinanceHistoricalFetcher
 from data.options_data import OptionContract
 from orchestration.activity_log import ActivityEntry
 from orchestration.activity_log import DEFAULT_LOG_PATH as DEFAULT_ACTIVITY_LOG_PATH
@@ -67,8 +70,41 @@ from orchestration.trade_log import TradeLogEntry, append_entry as append_trade_
 from safety.options_sizing import compute_contract_count
 from safety.order_validation import DuplicateOrderGuard, run_order_checks
 
+# How far back the AGENT should request bars via Robinhood MCP's
+# get_equity_historicals before calling `evaluate` -- referenced by the
+# routine's own prompt, not used for fetching here (this script never
+# fetches market data itself in agent mode; see _bars_from_json below).
+#
+# Both numbers are shaped by a real constraint discovered empirically: a
+# get_equity_historicals result over ~100-150K characters gets rejected as
+# "exceeds maximum allowed tokens" by the MCP host. That rules out batching
+# multiple symbols per call for anything but a very short window (10 symbols
+# of 1-day daily bars is already too big), so the routine's prompt has the
+# agent fetch ONE SYMBOL AT A TIME for both daily and intraday. Within a
+# single symbol: 400 calendar days of daily bars (~252 trading days) comes
+# back around 45K characters -- comfortable. 5-minute bars are far denser
+# (~11-12K characters/trading day), so INTRADAY_LOOKBACK_DAYS is deliberately
+# small -- this project's own confluence/FVG windows only look back 10-20
+# BARS (see run_live.py's ALPACA_INTRADAY_LOOKBACK_DAYS comment), so 3
+# trading days (~234 bars, ~35K characters) is already generous headroom,
+# not a tight fit.
 DAILY_LOOKBACK_DAYS = 400
-ALPACA_INTRADAY_LOOKBACK_DAYS = 20
+INTRADAY_LOOKBACK_DAYS = 3
+
+
+def _bars_from_json(records: list) -> pd.DataFrame:
+    """Converts the agent-supplied bar records (already fetched via
+    Robinhood MCP's get_equity_historicals -- see the routine's prompt)
+    into the same DataFrame shape every other fetcher in data/fetchers.py
+    produces: DatetimeIndex (UTC, ascending), lowercase open/high/low/
+    close/volume columns. Nothing downstream (brain/, safety/) can tell
+    the difference between this and a real fetcher's output -- that's the
+    point, it's the same contract.
+    """
+    df = pd.DataFrame(records)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.set_index("timestamp").sort_index()
+    return df[["open", "high", "low", "close", "volume"]].astype(float)
 
 
 def _build_executor(settings) -> OptionsOrderExecutor:
@@ -115,8 +151,17 @@ def _parse_quotes(raw: dict) -> Dict[str, OptionContract]:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
+    """No market-data fetch happens in this process at all -- bars are
+    supplied by the caller (the agent, via Robinhood MCP's
+    get_equity_historicals) in the stdin payload. This is deliberate, not
+    just a style choice: it means this script needs zero market-data
+    credentials of its own, which is what makes it usable inside a Claude
+    Code cloud routine's sandbox -- see the migration plan and the
+    routine's own prompt for why Alpaca (which needed an API key with
+    nowhere safe to store it in a routine's environment) was dropped in
+    favor of the data source the agent already has authorized access to.
+    """
     settings = load_settings(args.settings)
-    symbols = args.symbols or settings.broker.core_watchlist
 
     payload = json.load(sys.stdin)
     equity = float(payload["equity"])
@@ -125,36 +170,18 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     open_position_quotes = _parse_quotes(payload.get("open_position_quotes", {}))
     open_order_symbols = payload.get("open_order_symbols", [])
 
-    intraday_fetcher = AlpacaIntradayHistoricalFetcher()
-    daily_fetcher = YFinanceHistoricalFetcher()
     now = datetime.now(timezone.utc)
-
-    end = now
-    start = end - pd.Timedelta(days=ALPACA_INTRADAY_LOOKBACK_DAYS)
     intraday_bars = {}
-    for symbol in symbols:
-        try:
-            intraday_bars[symbol] = intraday_fetcher.get_bars(symbol, start.isoformat(), end.isoformat(), timeframe="5m")
-        except Exception as exc:
-            print(f"WARNING: {symbol}: intraday fetch failed ({exc}) -- skipping this cycle", file=sys.stderr)
-
-    # end.date() - 1, not end.date(): `now` is UTC, and UTC is ahead of US
-    # market time -- asking yfinance for a daily bar "through today (UTC)"
-    # can mean a US trading day that hasn't happened yet (e.g. late evening
-    # ET is already past midnight UTC), which comes back as a NaN row and
-    # fails the fetcher's own NaN check. One day of slack is irrelevant to
-    # a 200-day SMA, so just don't ask for a day that might not exist yet.
-    daily_end = end.date() - pd.Timedelta(days=1)
-    daily_start = daily_end - pd.Timedelta(days=DAILY_LOOKBACK_DAYS)
+    for symbol, records in payload.get("intraday_bars", {}).items():
+        if records:
+            intraday_bars[symbol] = _bars_from_json(records)
     daily_bars = {}
-    for symbol in symbols:
-        try:
-            daily_bars[symbol] = daily_fetcher.get_bars(symbol, daily_start.isoformat(), daily_end.isoformat(), timeframe="1D")
-        except Exception as exc:
-            print(f"WARNING: {symbol}: daily fetch failed ({exc}) -- SMA200 veto will fall back to intraday bars", file=sys.stderr)
+    for symbol, records in payload.get("daily_bars", {}).items():
+        if records:
+            daily_bars[symbol] = _bars_from_json(records)
 
     if not intraday_bars:
-        print(json.dumps({"live_trading_enabled": settings.broker.live_trading_enabled, "fetched_at": now.isoformat(), "records": [], "error": "no intraday bars fetched for any symbol"}))
+        print(json.dumps({"live_trading_enabled": settings.broker.live_trading_enabled, "fetched_at": now.isoformat(), "records": [], "error": "no intraday_bars supplied in the payload for any symbol"}))
         return
 
     executor = _build_executor(settings)
