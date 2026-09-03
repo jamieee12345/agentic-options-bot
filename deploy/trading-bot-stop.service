@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop trading-bot.service (triggered by trading-bot-stop.timer)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl stop trading-bot.service

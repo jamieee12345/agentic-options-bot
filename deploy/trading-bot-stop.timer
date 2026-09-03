@@ -1,0 +1,10 @@
+[Unit]
+Description=Stop trading-bot at market close (16:00 ET, weekdays)
+
+[Timer]
+OnCalendar=Mon..Fri 16:00 America/New_York
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,46 @@
+[Unit]
+Description=Trading bot - live FVG/confluence options loop (orchestration/run_live.py)
+# Started/stopped by trading-bot-start.timer / trading-bot-stop.timer
+# (9:30/16:00 America/New_York, weekdays) -- NOT enabled directly for
+# boot-start. Only the two timers get `systemctl enable`d; this service is
+# just started and stopped by them. You can still `systemctl start/stop
+# trading-bot` by hand any time outside that schedule.
+After=network-online.target
+Wants=network-online.target
+# StartLimitIntervalSec/Burst belong in [Unit], not [Service] -- systemd
+# silently ignores them (just logs "Unknown key name ... ignoring") if
+# placed in the wrong section, which is exactly what happened on the first
+# deploy. Caught by checking `systemctl status` after deploying, not by
+# assuming the file was right. Together these mean: stop retrying entirely
+# after 5 crashes within 10 minutes, rather than hammering the Robinhood/
+# Alpaca APIs indefinitely on a persistent failure (e.g. bad credentials).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trading-bot
+WorkingDirectory=/opt/trading_bot/trading_bot
+Environment=PYTHONPATH=/opt/trading_bot/trading_bot
+# Symbols here should match (or be a subset of) settings.yaml's
+# broker.core_watchlist. Edit this line directly to change the watchlist --
+# then `sudo systemctl daemon-reload && sudo systemctl restart trading-bot`.
+#
+# --poll-seconds (how often it looks) and --interval (the bar size signals
+# are computed from) are explicit here, not left to orchestration/run_live.py's
+# defaults, since they're deliberately DIFFERENT numbers now -- see that
+# file's module docstring for why decoupling them is safe (faster polling
+# catches a closed bar / a stop-loss trigger sooner; it does not mean
+# trading off noisier 1-minute bars, since --interval stays 5m).
+ExecStart=/opt/trading_bot/trading_bot/venv/bin/python orchestration/run_live.py --symbols SPY QQQ AAPL MSFT AMZN GOOGL NVDA META TSLA AMD JPM BAC UNH LLY XOM WMT COST DIS CAT IWM --interval 5m --poll-seconds 60
+
+# Auto-restart on crash -- RestartSec gives it 30s between attempts. The
+# actual attempt cap (StartLimitIntervalSec/Burst) lives in [Unit] above.
+Restart=always
+RestartSec=30
+
+StandardOutput=append:/var/log/trading-bot/run_live.log
+StandardError=append:/var/log/trading-bot/run_live.log
+
+[Install]
+WantedBy=multi-user.target

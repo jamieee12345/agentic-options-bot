@@ -1,0 +1,29 @@
+[Unit]
+Description=Start trading-bot 15min before market open (9:15 ET warm-up, weekdays)
+
+[Timer]
+# Explicit timezone in the calendar spec (systemd >= 239) -- correct
+# regardless of what timezone the server's own clock is set to, and
+# handles EST/EDT daylight saving automatically since America/New_York is
+# a real IANA zone, not a fixed UTC offset.
+#
+# Deliberately 15 minutes BEFORE the 9:30 open, not at it: on a cold start,
+# run_forever() (orchestration/run_live.py) has to load settings, log into
+# Robinhood, and build the executor before its first poll cycle -- real
+# seconds of overhead. Starting at 9:15 absorbs that overhead (plus a few
+# harmless early cycles against the prior day's still-unchanged last bar,
+# since there's no fresh options/intraday data before the bell) so the
+# 5-minute poll loop is already warmed up and mid-cadence by 9:30, instead
+# of only beginning to connect once the market's already open.
+OnCalendar=Mon..Fri 09:15 America/New_York
+# Deliberately NOT Persistent=true: if the server was off/down when 9:15
+# passed, this waits for the NEXT scheduled time rather than firing
+# immediately whenever it comes back up (which could otherwise start the
+# bot outside market hours after an outage). Start it manually
+# (`sudo systemctl start trading-bot`) if you need it running sooner than
+# that after downtime.
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

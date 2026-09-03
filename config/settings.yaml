@@ -1,0 +1,212 @@
+# Trading bot configuration
+# All ratios are fractions of capital unless noted otherwise (0.10 = 10%).
+
+broker:
+  provider: robinhood
+
+  # Hard kill-switch for real order placement (orchestration/order_execution.py).
+  # False = every approved order is logged as "[DRY RUN] would place order" and
+  # never reaches the broker. Must be flipped to true deliberately, and only
+  # after dry-run output has been reviewed -- this pipeline has not been run
+  # against a live account. The account it's ALSO restricted to is set
+  # separately, via the ROBINHOOD_ACCOUNT_NUMBER env var read by
+  # broker/robinhood_broker.py (never the account your Robinhood login
+  # defaults to) -- that restriction lives in .env, not here, on purpose.
+  live_trading_enabled: false
+
+  # Explicit large-cap tickers always eligible, regardless of the screen below.
+  # Expanded from the original 10 (mega-cap tech + 2 broad ETFs) on request
+  # -- that group is one correlated bet (tech sentiment moves all 10
+  # together), so a bad tech day meant every symbol's FVG signals agreed
+  # with each other for the wrong reason, not real independent confluence.
+  # The 10 added below spread across financials, healthcare, energy,
+  # consumer, industrials, and a small-cap-index ETF -- still all
+  # large-cap/mega-cap names with liquid, tight-spread options chains
+  # (required for max_bid_ask_spread_pct below to ever pass), just outside
+  # the original single-sector cluster.
+  core_watchlist:
+    - SPY
+    - QQQ
+    - AAPL
+    - MSFT
+    - AMZN
+    - GOOGL
+    - NVDA
+    - META
+    - TSLA
+    - AMD
+    - JPM    # financials
+    - BAC    # financials
+    - UNH    # healthcare
+    - LLY    # healthcare
+    - XOM    # energy
+    - WMT    # consumer staples
+    - COST   # consumer staples
+    - DIS    # consumer discretionary / media
+    - CAT    # industrials
+    - IWM    # small-cap index ETF -- diversifies away from mega-cap-only exposure
+
+  # Dynamic screen for "any other large cap" stocks. A hardcoded list beyond the
+  # core watchlist would need constant manual upkeep, so eligibility outside the
+  # core list is defined by these thresholds instead. Tune as needed.
+  universe_screen:
+    min_market_cap_usd: 10_000_000_000            # $10B floor for "large cap"
+    min_avg_daily_dollar_volume_usd: 50_000_000    # liquidity floor, excludes thin names
+    volume_lookback_days: 20
+
+  timeframes:
+    - 1D
+    - 1W
+
+strategy:
+  # NOTE: "volume" here is interpreted as volatility regime (per the earlier
+  # regime-strategy design), not literal trading volume as used in `broker`
+  # above. Flag this if you actually meant trading volume for these buckets.
+  allocation:
+    low_volatility: 0.95
+    mid_volatility_trending: 0.95
+    mid_volatility_no_trend: 0.60
+    high_volatility: 0.60
+
+  leverage:
+    low_volatility: 1.25
+
+  rebalance_threshold: 0.10          # min weight drift required before rebalancing
+  uncertainty_size_multiplier: 0.50  # scales size down when regime probability is uncertain
+
+risk:
+  max_risk_per_trade: 0.01           # 1% of capital risked per trade
+  max_exposure: 0.80                 # 80% of capital deployed at once, max
+  max_leverage: 1.25
+  max_single_position: 0.15          # 15% of capital in any one name
+  max_sector_exposure: 0.30          # 30% of capital in any one sector
+  max_concurrent_positions: 5
+  max_daily_trades: 20
+
+  # Pre-trade order validation (safety/order_validation.py): reject a market
+  # order if the quoted bid-ask spread is wider than this fraction of mid price.
+  max_bid_ask_spread_pct: 0.01
+
+  # Correlation-based size control (safety/correlation.py): "max correlated
+  # exposure" from the spec, implemented as a linear size-reduction ramp
+  # between these two thresholds and an outright rejection at/above the
+  # reject threshold. See that module's docstring for why linear, not a step.
+  correlation_lookback_days: 60
+  correlation_reduce_threshold: 0.70
+  correlation_reject_threshold: 0.85
+
+  drawdown_controls:
+    daily_loss_reduce: 0.02          # cut exposure at -2% on the day
+    daily_loss_halt: 0.03            # stop trading at -3% on the day
+    weekly_loss_reduce: 0.05
+    weekly_loss_halt: 0.07
+    max_loss_from_peak: 0.10         # hard circuit breaker, trailing from equity high-water mark
+
+options:
+  # Separate feature flag from broker.live_trading_enabled: this gates
+  # whether the options pipeline (brain/options_strategy.py,
+  # orchestration/options_execution.py) runs AT ALL. live_trading_enabled
+  # separately gates whether either pipeline's approved orders are actually
+  # sent to the broker vs. logged as dry-run -- the two are independent so
+  # equities and options can be turned on/off/live one at a time.
+  enabled: true
+
+  # HARD FLOOR, not a suggestion: 0DTE (same-day expiration) trades are
+  # never permitted. target_dte_min must be >= 1, enforced both here
+  # (config_loader.py) and again at the point of contract selection
+  # (data/options_data.py's MIN_ALLOWED_DTE), independently, on purpose.
+  #
+  # Shifted from 30-45 (monthly) to weekly-range contracts, on request:
+  # this account trades off a 5-minute intraday signal, and a 30-45 day
+  # contract is a real mismatch for that -- you'd be paying for a month of
+  # time value to capture a move the strategy expects to resolve in days,
+  # not weeks. target_dte_min is 2, not 1: literal 1DTE leaves zero room
+  # for ANY close_before_expiration_days buffer (there's no positive
+  # integer smaller than 1), so 2 is the closest value that still respects
+  # the 0DTE floor while leaving one full day of buffer below.
+  target_dte_min: 2
+  target_dte_max: 7
+
+  # Force-close any open options position within this many days of
+  # expiration, regardless of what the FVG signal wants that bar. Must be
+  # < target_dte_min, so a freshly opened position is never already inside
+  # its own force-close window. 1 (not the original 5) to fit inside the
+  # new 2-7 day window -- a position now only ever gets one day of runway
+  # before being forced out, which is the tightest this can go given
+  # target_dte_min=2.
+  close_before_expiration_days: 1
+
+  # Raised from 0.5%/5% (tuned for a much larger account) to 20%/30%, on
+  # request: at $1,000 equity, 0.5% is a $5 budget, which never clears
+  # safety/options_sizing.py's $50 minimum-premium floor -- the account
+  # could never open a single position at the old settings, full stop, no
+  # matter how good a signal was. This is a deliberate exception for a
+  # small, already-isolated account (separate from the primary portfolio),
+  # not a general recommendation -- dial back down as real capital grows,
+  # since the equity-side max_risk_per_trade (1%) is what a "normal" risk
+  # budget looks like once account size stops being the binding constraint.
+  # Raised again from 20%/30% to 40%/60% -- at $1,000 equity, several real
+  # signals today (see activity_log.jsonl 2026-09-02, NVDA ~15:07/15:48
+  # UTC) cleared confluence but sized to zero contracts because the
+  # option's premium x100 exceeded the old $200 per-trade budget. Total
+  # kept at 1.5x per-trade, same ratio as before, so one full-size trade
+  # still leaves some room for a second smaller one rather than consuming
+  # the entire budget outright.
+  max_premium_pct_per_trade: 0.40
+  max_total_premium_pct_of_equity: 0.60
+
+  # Fair Value Gap + volume momentum strategy (brain/fvg_indicators.py,
+  # brain/options_strategy.py). lookback_period/body_multiplier match the
+  # defaults in the originally supplied detect_fvg() function;
+  # volume_multiplier is the added "and volume where momentum is displayed"
+  # confirmation, same lookback window.
+  fvg_lookback_period: 10
+  fvg_body_multiplier: 1.5
+  fvg_volume_multiplier: 1.5
+
+  # Long-term trend filter (brain/trend_indicators.py). A hard veto in the
+  # confluence gate: never trade against this.
+  sma_period: 200
+
+  # Confluence gate (brain/confluence.py): require this fraction of
+  # applicable SOFT checks (break-of-structure, S/R, supply/demand,
+  # liquidity sweep, volume profile, RSI momentum, ATR volatility
+  # expansion) to agree with the candidate direction before trading.
+  # market-structure/200-SMA/Elliott-Wave are separate HARD VETOES --
+  # always enforced regardless of this number, see HARD_VETO_KEYS in
+  # confluence.py. This is "N% of independent rule-based checks agree,"
+  # not a backtested probability of profit -- see confluence.py's module
+  # docstring for why those are genuinely different claims.
+  #
+  # Lowered from 1.0 (literal unanimity) on request: at 100%, one
+  # disagreeing soft check blocked the trade regardless of how many others
+  # agreed -- day one logged 42 real gap+volume-confirmed signals and zero
+  # trades because of it. 0.6 still requires a clear majority, not just any
+  # agreement at all.
+  min_confluence_score: 0.6
+
+  # Force-close a long option once its current value has fallen this far
+  # below what was paid for it (0.50 = closes at a 50% loss rather than
+  # riding toward worthless/expiration). Checked every bar, independent of
+  # the FVG/confluence signal. Backed up by (checked BEFORE this) a
+  # structural FVG-invalidation stop -- has price closed back through the
+  # entire gap that triggered the trade? See
+  # orchestration/options_execution.py's module docstring.
+  stop_loss_pct: 0.50
+
+  # Force-close a long option once its current value has RISEN this far
+  # above what was paid for it -- locks in a gain rather than holding
+  # indefinitely. Added on request: confluence validates entries, not
+  # continuation, so nothing here actually confirms a favorable move keeps
+  # going. 0.75 is a starting point (a modest positive skew against the
+  # 50% stop above, roughly 1.5:1 reward:risk), not a backtested figure --
+  # adjust based on what you actually observe once trades start closing.
+  take_profit_pct: 0.75
+
+backtesting:
+  slippage_pct: 0.0005               # 5 bps per trade
+  initial_capital_usd: 2000
+
+monitoring:
+  dashboard_refresh_seconds: 5
+  alert_rate_limit_minutes: 15

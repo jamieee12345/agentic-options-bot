@@ -1,0 +1,6 @@
+[Unit]
+Description=Start trading-bot.service (triggered by trading-bot-start.timer)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl start trading-bot.service

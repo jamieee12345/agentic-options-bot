@@ -1,0 +1,18 @@
+# Data layer (this batch)
+pyyaml
+pandas
+numpy
+yfinance
+
+# Broker layer — unofficial Robinhood client + TOTP for app-based 2FA
+robin_stocks
+pyotp
+python-dotenv
+
+# Alpaca — official market-data API, used for live intraday bars
+alpaca-py
+
+hmmlearn
+
+# Coming next: dashboard, backtester
+# rich

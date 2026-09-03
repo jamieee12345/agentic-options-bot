@@ -1,0 +1,20 @@
+# Credentials -- NEVER commit this. See .env's own header comment.
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Dashboard-generated output (rebuilt on demand, not source)
+dashboard/output/
+
+# Local backups made during earlier deploys -- not source
+*.bak
+
+# The three trade-history logs (trade_log.jsonl, activity_log.jsonl,
+# equity_history.jsonl) are DELIBERATELY NOT ignored -- see the MCP
+# migration plan: a scheduled cloud routine gets a fresh checkout every
+# firing, so committing these back to the repo each cycle is how state
+# persists across hourly runs. Do not add them here.
