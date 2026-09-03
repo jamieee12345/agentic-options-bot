@@ -177,6 +177,19 @@ def run_symbol_backtest(
                 open_trade.exit_premium = current_value
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
+            else:
+                # "Close if going nowhere" -- matches
+                # orchestration/options_execution.py's stagnation check
+                # exactly (same fraction-of-own-DTE threshold, same P&L
+                # bar), only reachable here too if stop_loss/take_profit
+                # didn't already fire this bar.
+                dte_at_entry = (open_trade.expiration_date - open_trade.entry_date).days
+                days_held = (current_date - open_trade.entry_date).days
+                if days_held >= opt.stagnant_exit_hold_fraction * dte_at_entry and pnl_pct < opt.stagnant_exit_min_pnl_pct:
+                    open_trade.exit_date, open_trade.exit_reason = current_date, "stagnant"
+                    open_trade.exit_premium = current_value
+                    result.trades.append(open_trade)
+                    open_trade, just_closed_this_bar = None, True
 
         decision = decide_options_action(
             symbol, window, opt.fvg_lookback_period, opt.fvg_body_multiplier, opt.fvg_volume_multiplier,

@@ -152,6 +152,21 @@ class OptionsConfig:
     min_confluence_score: float
     stop_loss_pct: float
     take_profit_pct: float
+    # "Close if going nowhere": checked after stop_loss_pct/take_profit_pct
+    # (only reachable if neither of those already fired), so this only
+    # affects positions sitting in the boring middle. Once a position has
+    # been held for stagnant_exit_hold_fraction of its OWN dte_at_entry
+    # (e.g. 0.5 = halfway to expiration) without reaching
+    # stagnant_exit_min_pnl_pct, it's force-closed rather than left to ride
+    # the back half of its life -- where theta decay accelerates fastest --
+    # toward an expiration close. Added after a 3-year/20-symbol diagnostic
+    # backtest showed 48% of trades were closing on expiration at a -12.8%
+    # average loss, the single largest loss bucket by trade count, while
+    # take-profit trades (only 18% of trades) averaged +147%: too many
+    # positions were being allowed to decay all the way to expiration
+    # instead of being cut once they'd already shown they weren't working.
+    stagnant_exit_hold_fraction: float
+    stagnant_exit_min_pnl_pct: float
 
     def __post_init__(self) -> None:
         if self.target_dte_min < MIN_ALLOWED_DTE:
@@ -191,6 +206,22 @@ class OptionsConfig:
             raise ConfigError(f"options.stop_loss_pct ({self.stop_loss_pct}) must be in (0, 1]")
         if self.take_profit_pct <= 0:
             raise ConfigError(f"options.take_profit_pct ({self.take_profit_pct}) must be positive")
+        if not (0 < self.stagnant_exit_hold_fraction < 1):
+            raise ConfigError(f"options.stagnant_exit_hold_fraction ({self.stagnant_exit_hold_fraction}) must be in (0, 1)")
+        if self.stagnant_exit_min_pnl_pct <= -self.stop_loss_pct:
+            warnings.warn(
+                f"options.stagnant_exit_min_pnl_pct ({self.stagnant_exit_min_pnl_pct}) is <= -stop_loss_pct "
+                f"(-{self.stop_loss_pct}), so stop_loss_pct will always fire first -- the stagnant-exit check "
+                f"can never actually trigger as currently configured.",
+                stacklevel=2,
+            )
+        if self.stagnant_exit_min_pnl_pct >= self.take_profit_pct:
+            warnings.warn(
+                f"options.stagnant_exit_min_pnl_pct ({self.stagnant_exit_min_pnl_pct}) is >= take_profit_pct "
+                f"({self.take_profit_pct}), so take_profit_pct will always fire first -- the stagnant-exit check "
+                f"can never actually trigger as currently configured.",
+                stacklevel=2,
+            )
 
 
 @dataclass(frozen=True)

@@ -120,6 +120,8 @@ def _build_executor(settings) -> OptionsOrderExecutor:
         fvg_volume_multiplier=opt.fvg_volume_multiplier, sma_period=opt.sma_period,
         min_confluence_score=opt.min_confluence_score, stop_loss_pct=opt.stop_loss_pct,
         take_profit_pct=opt.take_profit_pct,
+        stagnant_exit_hold_fraction=opt.stagnant_exit_hold_fraction,
+        stagnant_exit_min_pnl_pct=opt.stagnant_exit_min_pnl_pct,
         live_trading_enabled=settings.broker.live_trading_enabled,
     )
 

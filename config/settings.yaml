@@ -203,6 +203,31 @@ options:
   # adjust based on what you actually observe once trades start closing.
   take_profit_pct: 0.75
 
+  # "Close if going nowhere" -- checked only after stop_loss_pct/
+  # take_profit_pct (so it can't preempt either), meaning it only ever
+  # affects a position sitting in the boring middle: not yet a big enough
+  # loser to stop out, not yet a big enough winner to take profit on. Once
+  # a position has been held for this fraction of its OWN dte_at_entry
+  # (e.g. a 4-DTE trade crosses the line after 2 days) without at least
+  # reaching stagnant_exit_min_pnl_pct, it's force-closed rather than left
+  # to decay through the back half of its life -- where theta erodes value
+  # fastest -- toward an expiration close. A 3-year/20-symbol diagnostic
+  # backtest showed 48% of trades were closing on expiration at a -12.8%
+  # average loss (the single largest loss bucket by trade count), while
+  # take-profit trades -- only 18% of trades -- averaged +147%: too many
+  # positions were being allowed to just decay instead of being cut once
+  # they'd already shown they weren't working.
+  stagnant_exit_hold_fraction: 0.5
+
+  # Minimum P&L (as a fraction of entry premium) a position must have
+  # reached by the stagnant_exit_hold_fraction checkpoint above, or it gets
+  # closed as stagnant. 0.0 = must be at least breakeven -- since theta
+  # decay is constant, merely holding steady in dollar terms already means
+  # the underlying's move is offsetting decay, a reasonable bar for "this
+  # is still working." Not a backtested figure -- a starting point, same
+  # as stop_loss_pct/take_profit_pct above.
+  stagnant_exit_min_pnl_pct: 0.0
+
 backtesting:
   slippage_pct: 0.0005               # 5 bps per trade
   initial_capital_usd: 2000
