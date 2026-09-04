@@ -15,15 +15,15 @@ broker:
   live_trading_enabled: false
 
   # Explicit large-cap tickers always eligible, regardless of the screen below.
-  # Expanded from the original 10 (mega-cap tech + 2 broad ETFs) on request
-  # -- that group is one correlated bet (tech sentiment moves all 10
-  # together), so a bad tech day meant every symbol's FVG signals agreed
-  # with each other for the wrong reason, not real independent confluence.
-  # The 10 added below spread across financials, healthcare, energy,
-  # consumer, industrials, and a small-cap-index ETF -- still all
-  # large-cap/mega-cap names with liquid, tight-spread options chains
-  # (required for max_bid_ask_spread_pct below to ever pass), just outside
-  # the original single-sector cluster.
+  # Narrowed back to this original 10 (mega-cap tech + 2 broad ETFs) on
+  # request -- an earlier expansion to 20 (adding financials, healthcare,
+  # energy, consumer, industrials, and a small-cap ETF) was meant to
+  # diversify away from "one correlated bet" (a bad tech day moving every
+  # symbol's FVG signal the same way for the wrong reason), but that
+  # trade-off is being set aside for now in favor of a smaller, more
+  # familiar set while validating the same-day/trend-invalidation redesign.
+  # All still large-cap/mega-cap names with liquid, tight-spread options
+  # chains (required for max_bid_ask_spread_pct below to ever pass).
   core_watchlist:
     - SPY
     - QQQ
@@ -35,16 +35,6 @@ broker:
     - META
     - TSLA
     - AMD
-    - JPM    # financials
-    - BAC    # financials
-    - UNH    # healthcare
-    - LLY    # healthcare
-    - XOM    # energy
-    - WMT    # consumer staples
-    - COST   # consumer staples
-    - DIS    # consumer discretionary / media
-    - CAT    # industrials
-    - IWM    # small-cap index ETF -- diversifies away from mega-cap-only exposure
 
   # Dynamic screen for "any other large cap" stocks. A hardcoded list beyond the
   # core watchlist would need constant manual upkeep, so eligibility outside the
