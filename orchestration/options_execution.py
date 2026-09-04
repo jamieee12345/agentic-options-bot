@@ -26,7 +26,7 @@ or the portfolio premium cap against a position that hasn't settled yet.
 
 No assignment-risk handling needed here (that's specific to being SHORT an
 option -- covered calls, cash-secured puts, naked writes -- none of which
-this does). Six things this DOES manage for an existing position, checked
+this does). Five things this DOES manage for an existing position, checked
 BEFORE the signal, in this order:
   1. Max hold (`max_hold_days`) -- unconditional, checked FIRST: once a
      position has been open this many calendar days, force-close it no
@@ -44,24 +44,34 @@ BEFORE the signal, in this order:
      the premise is gone regardless of what the option's current value
      says. Needs the triggering gap's bounds, persisted at open time via
      orchestration/trade_log.py (survives the bot stopping overnight).
-  4. Stop-loss (`stop_loss_pct`) -- the dollar backstop underneath #3:
-     force-close once current value has fallen this fraction below entry,
-     independent of any structural read. Catches gap risk / cases the FVG
-     check doesn't -- both #3 and #4 exist because either can fire first.
-  5. Take-profit (`take_profit_pct`) -- lock in a gain rather than ride it
-     indefinitely. Nothing in this system confirms a move will CONTINUE
-     once it's already worked -- confluence only validates entries, not
-     continuation -- so an open-ended hold on a winner has no more
-     informational backing than one on a loser.
-  6. Stagnation (`stagnant_exit_hold_fraction`/`stagnant_exit_min_pnl_pct`)
-     -- "close if going nowhere": only reachable if #4/#5 didn't already
-     fire, so this only affects a position in the boring middle. Once held
-     for `stagnant_exit_hold_fraction` of its own dte_at_entry without
-     reaching `stagnant_exit_min_pnl_pct`, force-close rather than let it
-     ride toward an expiration close. Still meaningfully tighter than #1
-     for a 1-DTE position specifically (0.5 * 1 day = 12h vs. max_hold_days'
-     24h) -- for a 2-DTE position the two thresholds coincide (0.5 * 2 = 1
-     day), so #1 wins the race there since it's unconditional.
+  4. Trend invalidation -- re-runs the SAME hard-veto checks
+     (brain/confluence.py's trend_200sma/market_structure/elliott_wave)
+     that would have BLOCKED opening this position fresh right now,
+     against the position's own direction. Any one of them currently
+     failing means the structural premise that justified the trade is
+     gone -- close it, regardless of current P&L. This is deliberately
+     the ONLY profit/loss exit in this system now: it replaced fixed
+     stop_loss_pct/take_profit_pct dollar thresholds entirely, on
+     request -- "let the trend decide" rather than an arbitrary percent,
+     for both cutting a loser and locking in a winner. Operates on the
+     underlying's bars, same as #3, no options quote needed.
+  5. Stagnation (`stagnant_exit_hold_fraction`/`stagnant_exit_min_pnl_pct`)
+     -- "close if going nowhere": only reachable if #4 didn't already
+     fire, so this only affects a position the trend check hasn't
+     flagged. Once held for `stagnant_exit_hold_fraction` of its own
+     dte_at_entry without reaching `stagnant_exit_min_pnl_pct`,
+     force-close rather than let it ride toward an expiration close.
+     Still meaningfully tighter than #1 for a 1-DTE position specifically
+     (0.5 * 1 day = 12h vs. max_hold_days' 24h) -- for a 2-DTE position
+     the two thresholds coincide (0.5 * 2 = 1 day), so #1 wins the race
+     there since it's unconditional.
+
+NOTE: config/settings.yaml's stop_loss_pct/take_profit_pct still exist,
+but ONLY for orchestration/trade_grading.py's retrospective outcome
+bucketing (a closed trade's own record of "was this a big win/small
+loss/etc" relative to those numbers) -- they no longer drive any live
+exit decision here. Don't be misled by a trade closing well past either
+threshold; that's expected now, not a bug.
 """
 from __future__ import annotations
 
@@ -73,6 +83,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from brain.confluence import HARD_VETO_KEYS, evaluate_confluence
 from brain.options_strategy import OptionsDecision, decide_options_action
 from data.options_data import OptionContract, RobinhoodOptionChainFetcher
 from orchestration.activity_log import ActivityEntry
@@ -196,8 +207,6 @@ class OptionsOrderExecutor:
         fvg_volume_multiplier: float,
         sma_period: int,
         min_confluence_score: float,
-        stop_loss_pct: float,
-        take_profit_pct: float,
         stagnant_exit_hold_fraction: float,
         stagnant_exit_min_pnl_pct: float,
         max_hold_days: int,
@@ -220,23 +229,9 @@ class OptionsOrderExecutor:
         self.fvg_volume_multiplier = fvg_volume_multiplier
         self.sma_period = sma_period
         self.min_confluence_score = min_confluence_score
-        # Fraction of entry premium a long position is allowed to lose before
-        # being force-closed -- e.g. 0.50 closes a position once it's worth
-        # half what was paid for it. A long option's max loss is already
-        # capped at 100% of premium by construction; this cuts losses well
-        # before that, rather than riding every losing trade to worthless or
-        # expiration.
-        self.stop_loss_pct = stop_loss_pct
-        # Fraction of entry premium a position must GAIN before being
-        # force-closed to lock it in. No indicator in this system confirms
-        # a favorable move will keep going -- confluence is an entry
-        # filter, not a continuation forecast -- so an unbounded hold on a
-        # winner is exposed the same way an unbounded hold on a loser
-        # would be without stop_loss_pct.
-        self.take_profit_pct = take_profit_pct
         # "Close if going nowhere" -- see the class/module docstrings for
-        # why. Only ever reached after stop_loss_pct/take_profit_pct have
-        # both failed to fire this bar (see _check_price_based_exit).
+        # why. Only ever reached after trend invalidation didn't already
+        # fire this bar (see _check_stagnation_exit).
         self.stagnant_exit_hold_fraction = stagnant_exit_hold_fraction
         self.stagnant_exit_min_pnl_pct = stagnant_exit_min_pnl_pct
         # Unconditional holding-time cap, checked FIRST in run() -- see
@@ -315,11 +310,18 @@ class OptionsOrderExecutor:
                     records.append(fvg_record)
                     continue
 
-                price_exit_record = self._check_price_based_exit(
+                trend_record = self._check_trend_invalidation(
+                    symbol, existing, symbol_bars, (daily_bars or {}).get(symbol), now, open_order_symbols, open_position_quotes,
+                )
+                if trend_record is not None:
+                    records.append(trend_record)
+                    continue
+
+                stagnation_record = self._check_stagnation_exit(
                     symbol, existing, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes,
                 )
-                if price_exit_record is not None:
-                    records.append(price_exit_record)
+                if stagnation_record is not None:
+                    records.append(stagnation_record)
                     continue
 
             decision = decide_options_action(
@@ -411,8 +413,9 @@ class OptionsOrderExecutor:
         """Structural stop: has price closed back through the ENTIRE Fair
         Value Gap that triggered this position? If so the setup's premise
         is gone, independent of what the option's dollar value says --
-        checked BEFORE the price-based stop/take-profit for exactly that
-        reason. `open_trade` is this symbol's own logged "open" entry
+        checked BEFORE the broader trend-invalidation check (a narrower,
+        faster-to-trip test specific to the exact gap that justified this
+        trade). `open_trade` is this symbol's own logged "open" entry
         (orchestration/trade_log.py), which is where the triggering gap's
         bounds actually live -- they don't exist anywhere else, since
         OpenOptionPosition comes from the broker and has no memory of why
@@ -440,17 +443,64 @@ class OptionsOrderExecutor:
             )
         return None
 
-    def _check_price_based_exit(
+    def _check_trend_invalidation(
+        self, symbol, existing: OpenOptionPosition, symbol_bars: pd.DataFrame, daily_bars_for_symbol: Optional[pd.DataFrame],
+        now, open_order_symbols, open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
+    ) -> Optional[OptionsExecutionRecord]:
+        """Re-runs the SAME hard-veto checks (brain/confluence.py's
+        trend_200sma/market_structure/elliott_wave) that would have
+        BLOCKED opening this position fresh right now, against the
+        position's own direction -- exact same call brain/options_strategy.py
+        makes for a fresh entry, just with the direction fixed to whatever
+        this position already is instead of a candidate FVG's direction.
+
+        If any of the three currently fails, the structural premise that
+        justified the trade is gone -- close it, regardless of current
+        P&L. This is the ONLY profit/loss exit in this system: it replaced
+        fixed stop_loss_pct/take_profit_pct dollar thresholds entirely, on
+        request ("let the trend decide" rather than an arbitrary percent).
+
+        Runs off the underlying's bars, like _check_fvg_invalidation --
+        needs no options quote of its own (a quote is only needed later,
+        by _close, to price the actual limit order).
+
+        IMPORTANT: `result.veto_reason` is NOT, by itself, "a hard veto
+        fired" -- evaluate_confluence() also sets it when the SOFT
+        confluence score merely drops below min_confluence_score, or when
+        too few soft checks are applicable. Those are normal, expected
+        states for an already-open position (soft checks drift constantly)
+        and were explicitly NOT what "trend broke" was meant to mean here
+        -- so this checks `details` for the three HARD_VETO_KEYS
+        specifically. When one of them IS the failure, evaluate_confluence
+        returns immediately on that branch (before ever reaching the
+        soft-score logic), so `result.veto_reason` is guaranteed to be
+        worded for that exact hard veto, not the soft score -- safe to
+        reuse verbatim for the close reason once this check confirms it's
+        a real hard-veto case.
+        """
+        direction = "bullish" if existing.option_type == "call" else "bearish"
+        result = evaluate_confluence(
+            symbol_bars, direction, sma_period=self.sma_period, min_confluence_score=self.min_confluence_score,
+            fvg_lookback_period=self.fvg_lookback_period, fvg_body_multiplier=self.fvg_body_multiplier,
+            daily_bars=daily_bars_for_symbol,
+        )
+        if any(result.details.get(k) == "fail" for k in HARD_VETO_KEYS):
+            return self._close(
+                symbol, existing, now, open_order_symbols,
+                f"trend_invalidated: {result.veto_reason}",
+                open_position_quotes,
+            )
+        return None
+
+    def _check_stagnation_exit(
         self, symbol, existing: OpenOptionPosition, open_trade, now, open_order_symbols,
         open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
     ) -> Optional[OptionsExecutionRecord]:
-        """Stop-loss, take-profit, and the stagnation ("close if going
-        nowhere") check, all from one quote -- checked every bar an
-        existing position isn't already being closed for expiration or FVG
-        invalidation. Needs a fresh quote regardless of what the FVG/
-        confluence signal says this bar -- monitoring an open long option's
-        current value is a bar-by-bar obligation, not something that can
-        wait for a new signal to show up.
+        """"Close if going nowhere" -- checked every bar an existing
+        position isn't already being closed for expiration, FVG
+        invalidation, or trend invalidation. Needs a fresh options quote
+        (unlike the checks above, which read the underlying) to compute
+        current P&L.
 
         Broker mode fetches that quote itself via chain_fetcher; agent mode
         has no chain_fetcher, so it reads from the caller-supplied
@@ -460,13 +510,14 @@ class OptionsOrderExecutor:
 
         `open_trade` is this symbol's own logged "open" entry
         (orchestration/trade_log.py) -- same source _check_fvg_invalidation
-        uses, needed here for `opened_at`/`dte_at_entry` to evaluate the
-        stagnation check. A missing `open_trade` (or a missing
-        dte_at_entry, e.g. a log predating this field) just skips the
-        stagnation check, not the stop-loss/take-profit checks above it.
+        uses, needed here for `opened_at`/`dte_at_entry`. A missing
+        `open_trade` (or a missing dte_at_entry, e.g. a log predating this
+        field) just skips this check entirely.
         """
         if existing.average_premium_paid <= 0:
             return None  # no known entry cost to measure P&L against (e.g. adapter couldn't read average_price) -- fail open rather than close on bad data
+        if open_trade is None or not open_trade.dte_at_entry:
+            return None
 
         if self._agent_mode:
             quote = (open_position_quotes or {}).get(symbol)
@@ -475,42 +526,28 @@ class OptionsOrderExecutor:
                 symbol, existing.option_type, existing.expiration_date, existing.strike_price,
             )
         if quote is None or quote.mid_price is None:
-            logger.warning("%s: no fresh quote available for the stop-loss/take-profit check this bar -- skipping", symbol)
+            logger.warning("%s: no fresh quote available for the stagnation check this bar -- skipping", symbol)
             return None
 
         current_value = quote.mid_price * existing.quantity * 100
         entry_value = existing.average_premium_paid * existing.quantity * 100
         pnl_pct = (current_value / entry_value) - 1  # positive = gain, negative = loss
 
-        if -pnl_pct >= self.stop_loss_pct:
-            return self._close(
-                symbol, existing, now, open_order_symbols,
-                f"stop_loss: down {-pnl_pct:.0%} from entry (${entry_value:.2f} -> ${current_value:.2f}), limit is {self.stop_loss_pct:.0%}",
-                open_position_quotes,
-            )
-        if pnl_pct >= self.take_profit_pct:
-            return self._close(
-                symbol, existing, now, open_order_symbols,
-                f"take_profit: up {pnl_pct:.0%} from entry (${entry_value:.2f} -> ${current_value:.2f}), target is {self.take_profit_pct:.0%}",
-                open_position_quotes,
-            )
+        try:
+            opened_at = datetime.fromisoformat(open_trade.opened_at)
+        except (TypeError, ValueError):
+            return None
 
-        if open_trade is not None and open_trade.dte_at_entry:
-            try:
-                opened_at = datetime.fromisoformat(open_trade.opened_at)
-            except (TypeError, ValueError):
-                opened_at = None
-            if opened_at is not None:
-                days_held = (now.date() - opened_at.date()).days
-                hold_threshold = self.stagnant_exit_hold_fraction * open_trade.dte_at_entry
-                if days_held >= hold_threshold and pnl_pct < self.stagnant_exit_min_pnl_pct:
-                    return self._close(
-                        symbol, existing, now, open_order_symbols,
-                        f"stagnant: held {days_held}d ({hold_threshold:.1f}d threshold on a {open_trade.dte_at_entry}d "
-                        f"DTE-at-entry position), pnl {pnl_pct:+.0%} hasn't reached the "
-                        f"{self.stagnant_exit_min_pnl_pct:+.0%} bar -- closing before theta decay accelerates into expiration",
-                        open_position_quotes,
-                    )
+        days_held = (now.date() - opened_at.date()).days
+        hold_threshold = self.stagnant_exit_hold_fraction * open_trade.dte_at_entry
+        if days_held >= hold_threshold and pnl_pct < self.stagnant_exit_min_pnl_pct:
+            return self._close(
+                symbol, existing, now, open_order_symbols,
+                f"stagnant: held {days_held}d ({hold_threshold:.1f}d threshold on a {open_trade.dte_at_entry}d "
+                f"DTE-at-entry position), pnl {pnl_pct:+.0%} hasn't reached the "
+                f"{self.stagnant_exit_min_pnl_pct:+.0%} bar -- closing before theta decay accelerates into expiration",
+                open_position_quotes,
+            )
         return None
 
     def _close(

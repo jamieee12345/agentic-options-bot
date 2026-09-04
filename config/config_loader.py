@@ -150,11 +150,17 @@ class OptionsConfig:
     fvg_volume_multiplier: float
     sma_period: int
     min_confluence_score: float
+    # No longer live exit triggers -- see orchestration/options_execution.py's
+    # _check_trend_invalidation, which replaced both with a single
+    # trend-based exit (re-checks the same hard-veto checks that gated
+    # entry; either one flipping closes the position, win or lose). Kept
+    # here only as stable reference numbers for
+    # orchestration/trade_grading.py's retrospective outcome bucketing.
     stop_loss_pct: float
     take_profit_pct: float
-    # "Close if going nowhere": checked after stop_loss_pct/take_profit_pct
-    # (only reachable if neither of those already fired), so this only
-    # affects positions sitting in the boring middle. Once a position has
+    # "Close if going nowhere": checked after trend invalidation (only
+    # reachable if that didn't already fire), so this only affects
+    # positions sitting in the boring middle. Once a position has
     # been held for stagnant_exit_hold_fraction of its OWN dte_at_entry
     # (e.g. 0.5 = halfway to expiration) without reaching
     # stagnant_exit_min_pnl_pct, it's force-closed rather than left to ride
@@ -218,20 +224,11 @@ class OptionsConfig:
             raise ConfigError(f"options.take_profit_pct ({self.take_profit_pct}) must be positive")
         if not (0 < self.stagnant_exit_hold_fraction < 1):
             raise ConfigError(f"options.stagnant_exit_hold_fraction ({self.stagnant_exit_hold_fraction}) must be in (0, 1)")
-        if self.stagnant_exit_min_pnl_pct <= -self.stop_loss_pct:
-            warnings.warn(
-                f"options.stagnant_exit_min_pnl_pct ({self.stagnant_exit_min_pnl_pct}) is <= -stop_loss_pct "
-                f"(-{self.stop_loss_pct}), so stop_loss_pct will always fire first -- the stagnant-exit check "
-                f"can never actually trigger as currently configured.",
-                stacklevel=2,
-            )
-        if self.stagnant_exit_min_pnl_pct >= self.take_profit_pct:
-            warnings.warn(
-                f"options.stagnant_exit_min_pnl_pct ({self.stagnant_exit_min_pnl_pct}) is >= take_profit_pct "
-                f"({self.take_profit_pct}), so take_profit_pct will always fire first -- the stagnant-exit check "
-                f"can never actually trigger as currently configured.",
-                stacklevel=2,
-            )
+        # NOTE: stop_loss_pct/take_profit_pct no longer bind as live exit
+        # triggers (see orchestration/options_execution.py's
+        # _check_trend_invalidation) -- they're grading-display references
+        # only now, so a warning about them "preempting" stagnant-exit
+        # would no longer be true. Removed rather than left stale.
         if self.max_hold_days <= 0:
             raise ConfigError(f"options.max_hold_days ({self.max_hold_days}) must be positive")
 

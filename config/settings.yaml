@@ -199,29 +199,28 @@ options:
   # agreement at all.
   min_confluence_score: 0.6
 
-  # Force-close a long option once its current value has fallen this far
-  # below what was paid for it (0.50 = closes at a 50% loss rather than
-  # riding toward worthless/expiration). Checked every bar, independent of
-  # the FVG/confluence signal. Backed up by (checked BEFORE this) a
-  # structural FVG-invalidation stop -- has price closed back through the
-  # entire gap that triggered the trade? See
-  # orchestration/options_execution.py's module docstring.
+  # NO LONGER A LIVE EXIT TRIGGER -- as of the trend-invalidation redesign
+  # (orchestration/options_execution.py's _check_trend_invalidation), the
+  # only profit/loss exit is re-checking the same hard-veto trend checks
+  # (200-SMA/market-structure/Elliott-Wave) that gated entry, against the
+  # held position; a fixed dollar stop no longer fires at all. This value
+  # is kept ONLY so orchestration/trade_grading.py can bucket a closed
+  # trade's outcome ("clean win"/"small loss"/etc) against a stable
+  # reference number for retrospective display -- it does nothing live.
+  # Don't be misled by a trade closing well past this percentage; that's
+  # expected now, not a bug.
   stop_loss_pct: 0.50
 
-  # Force-close a long option once its current value has RISEN this far
-  # above what was paid for it -- locks in a gain rather than holding
-  # indefinitely. Added on request: confluence validates entries, not
-  # continuation, so nothing here actually confirms a favorable move keeps
-  # going. 0.75 is a starting point (a modest positive skew against the
-  # 50% stop above, roughly 1.5:1 reward:risk), not a backtested figure --
-  # adjust based on what you actually observe once trades start closing.
+  # Same story as stop_loss_pct immediately above -- grading-display
+  # reference only, not a live exit trigger. Trend invalidation now
+  # decides when to lock in a gain too: ride it until the trend that
+  # justified the trade breaks, not a fixed percentage.
   take_profit_pct: 0.75
 
-  # "Close if going nowhere" -- checked only after stop_loss_pct/
-  # take_profit_pct (so it can't preempt either), meaning it only ever
-  # affects a position sitting in the boring middle: not yet a big enough
-  # loser to stop out, not yet a big enough winner to take profit on. Once
-  # a position has been held for this fraction of its OWN dte_at_entry
+  # "Close if going nowhere" -- checked only after trend invalidation
+  # (so it can't preempt that), meaning it only ever affects a position
+  # the trend check hasn't already flagged. Once a position has been held
+  # for this fraction of its OWN dte_at_entry
   # (e.g. a 4-DTE trade crosses the line after 2 days) without at least
   # reaching stagnant_exit_min_pnl_pct, it's force-closed rather than left
   # to decay through the back half of its life -- where theta erodes value
