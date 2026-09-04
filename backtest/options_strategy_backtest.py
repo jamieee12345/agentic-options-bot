@@ -238,7 +238,7 @@ def run_symbol_backtest(
 
         decision = decide_options_action(
             symbol, window, opt.fvg_lookback_period, opt.fvg_body_multiplier, opt.fvg_volume_multiplier,
-            opt.sma_period, opt.min_confluence_score,
+            opt.sma_period, opt.min_confluence_score, min_gap_atr_multiplier=opt.fvg_min_gap_atr_multiplier,
         )
 
         if "no fair value gap" not in decision.reasoning and "didn't confirm it" not in decision.reasoning:
@@ -387,6 +387,7 @@ def run_symbol_backtest_intraday(
             symbol, window, opt.fvg_lookback_period, opt.fvg_body_multiplier, opt.fvg_volume_multiplier,
             opt.sma_period, opt.min_confluence_score,
             daily_bars=daily_window if not daily_window.empty else None,
+            min_gap_atr_multiplier=opt.fvg_min_gap_atr_multiplier,
         )
 
         if "no fair value gap" not in decision.reasoning and "didn't confirm it" not in decision.reasoning:

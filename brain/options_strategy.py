@@ -34,6 +34,7 @@ from brain.confluence import DEFAULT_MIN_CONFLUENCE_SCORE, evaluate_confluence
 from brain.fvg_indicators import (
     DEFAULT_BODY_MULTIPLIER,
     DEFAULT_LOOKBACK_PERIOD,
+    DEFAULT_MIN_GAP_ATR_MULTIPLIER,
     DEFAULT_VOLUME_MULTIPLIER,
     detect_fair_value_gaps,
 )
@@ -80,6 +81,7 @@ def decide_options_action(
     sma_period: int = DEFAULT_SMA_PERIOD,
     min_confluence_score: float = DEFAULT_MIN_CONFLUENCE_SCORE,
     daily_bars: Optional[pd.DataFrame] = None,
+    min_gap_atr_multiplier: float = DEFAULT_MIN_GAP_ATR_MULTIPLIER,
 ) -> OptionsDecision:
     """`bars` is whatever interval the live strategy is actually watching
     for FVG/momentum (intraday, for live trading -- see
@@ -90,7 +92,7 @@ def decide_options_action(
     if len(bars) < MIN_BARS_REQUIRED:
         return OptionsDecision(symbol, "hold", 0.0, f"only {len(bars)} bar(s) available, need at least {MIN_BARS_REQUIRED}")
 
-    gaps = detect_fair_value_gaps(bars, lookback_period, body_multiplier, volume_multiplier)
+    gaps = detect_fair_value_gaps(bars, lookback_period, body_multiplier, volume_multiplier, min_gap_atr_multiplier)
     latest_gap = gaps[-1]  # the most recent bar's result -- "fresh" means formed right now, not a stale historical gap
 
     if latest_gap is None:

@@ -205,6 +205,7 @@ class OptionsOrderExecutor:
         fvg_lookback_period: int,
         fvg_body_multiplier: float,
         fvg_volume_multiplier: float,
+        fvg_min_gap_atr_multiplier: float,
         sma_period: int,
         min_confluence_score: float,
         stagnant_exit_hold_fraction: float,
@@ -227,6 +228,7 @@ class OptionsOrderExecutor:
         self.fvg_lookback_period = fvg_lookback_period
         self.fvg_body_multiplier = fvg_body_multiplier
         self.fvg_volume_multiplier = fvg_volume_multiplier
+        self.fvg_min_gap_atr_multiplier = fvg_min_gap_atr_multiplier
         self.sma_period = sma_period
         self.min_confluence_score = min_confluence_score
         # "Close if going nowhere" -- see the class/module docstrings for
@@ -327,7 +329,7 @@ class OptionsOrderExecutor:
             decision = decide_options_action(
                 symbol, symbol_bars, self.fvg_lookback_period, self.fvg_body_multiplier, self.fvg_volume_multiplier,
                 self.sma_period, self.min_confluence_score,
-                daily_bars=(daily_bars or {}).get(symbol),
+                daily_bars=(daily_bars or {}).get(symbol), min_gap_atr_multiplier=self.fvg_min_gap_atr_multiplier,
             )
             # Every branch below that stems from `decision` (not from an
             # executor-level position-management check above) carries the

@@ -148,6 +148,14 @@ class OptionsConfig:
     fvg_lookback_period: int
     fvg_body_multiplier: float
     fvg_volume_multiplier: float
+    # Minimum gap size, as a multiple of the symbol's own ATR -- see
+    # brain/fvg_indicators.py's module docstring for why this was added
+    # (fvg_body_multiplier/fvg_volume_multiplier constrain the displacement
+    # CANDLE, never the gap's own size, so a geometrically-valid but
+    # trivially-small gap could pass both and still just be noise that
+    # gets closed immediately -- diagnosed as this strategy's single
+    # largest loss bucket by trade count).
+    fvg_min_gap_atr_multiplier: float
     sma_period: int
     min_confluence_score: float
     # No longer live exit triggers -- see orchestration/options_execution.py's
@@ -214,6 +222,8 @@ class OptionsConfig:
             raise ConfigError(f"options.fvg_body_multiplier ({self.fvg_body_multiplier}) must be positive")
         if self.fvg_volume_multiplier <= 0:
             raise ConfigError(f"options.fvg_volume_multiplier ({self.fvg_volume_multiplier}) must be positive")
+        if self.fvg_min_gap_atr_multiplier < 0:
+            raise ConfigError(f"options.fvg_min_gap_atr_multiplier ({self.fvg_min_gap_atr_multiplier}) must be non-negative")
         if self.sma_period <= 0:
             raise ConfigError(f"options.sma_period ({self.sma_period}) must be positive")
         if not (0 < self.min_confluence_score <= 1.0):

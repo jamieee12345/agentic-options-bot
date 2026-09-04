@@ -168,6 +168,23 @@ options:
   fvg_body_multiplier: 1.5
   fvg_volume_multiplier: 1.5
 
+  # Minimum gap SIZE (not the displacement candle's body/volume, which the
+  # two above already constrain), as a fraction of this symbol's own ATR.
+  # Added after a 20-symbol/58-day intraday backtest diagnostic: closing
+  # back through the entire gap ("fvg_invalidated") was the single largest
+  # loss bucket by trade count -- 42% of all trades, 0% win rate by
+  # construction. lookback_period/body_multiplier above were never
+  # actually calibrated for 5-minute bars -- they're just the defaults
+  # from the originally supplied reference detect_fvg() -- and neither one
+  # constrains how BIG the resulting gap actually is, only the
+  # displacement candle's body/volume relative to its own recent average.
+  # A geometrically-valid but tiny gap (well within normal noise for that
+  # symbol) can pass both tests and still just get closed on the next
+  # bar. 0.5 = the gap must span at least half of a typical single bar's
+  # high-low range -- a moderate, principled floor, not a value searched
+  # for against that backtest's results.
+  fvg_min_gap_atr_multiplier: 0.5
+
   # Long-term trend filter (brain/trend_indicators.py). A hard veto in the
   # confluence gate: never trade against this.
   sma_period: 200
