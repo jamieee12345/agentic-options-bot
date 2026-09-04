@@ -1,25 +1,39 @@
-"""Continuously-refreshing HTML dashboard for the Agentic Robinhood account.
+"""Refreshing HTML dashboard for the Agentic Robinhood account -- MCP era.
 
-How this actually gets you a "constantly refreshing" dashboard: this script
-runs forever, re-fetching account state and rewriting one HTML file to disk
-every `--refresh-seconds`. The HTML itself has a <meta http-equiv="refresh">
-tag, so a browser tab left open on that file refreshes ITSELF on the same
+How this actually gets you a "refreshing" dashboard: this script runs
+forever, re-reading local files and rewriting one HTML file to disk every
+`--refresh-seconds`. The HTML itself has a <meta http-equiv="refresh"> tag,
+so a browser tab left open on that file refreshes ITSELF on the same
 interval, just by re-reading the file from disk -- no web server needed,
 and no bridge from this chat to your browser is needed either (there isn't
 one; a chat conversation can't push updates to a page on its own).
 
-Run it (needs the venv set up per README's Setup section, and
-ROBINHOOD_USERNAME/PASSWORD/MFA_SECRET/ACCOUNT_NUMBER in your .env --
-never put those values in this file):
+Run it (needs the venv set up per README's Setup section -- no Robinhood
+credentials of any kind, see below for why):
 
     PYTHONPATH=. python3 dashboard/live_account_dashboard.py
 
 Then open dashboard/output/live_dashboard.html in a browser and leave the
 tab open.
 
-Deliberately read-only: this only ever calls the broker's GET-style methods
-(equity, positions, option positions, open orders, quotes) -- never
-place_order/place_option_order. It's a monitor, not a trading loop.
+THIS FILE MAKES NO BROKER OR MCP CALLS AT ALL -- deliberately, not just as
+an optimization. It used to call RobinhoodBroker (robin_stocks) directly
+for live equity/positions, polling every 15s; that's exactly the kind of
+automated/programmatic Robinhood API access this project's whole MCP
+migration was meant to eliminate, read-only or not. A plain Python script
+like this one has no way to call Robinhood MCP tools anyway -- only an
+interactive Claude Code session or a scheduled routine can. So instead:
+the hourly MCP routine writes `account_snapshot.json` (equity, buying
+power, open option positions with fresh quotes) every cycle as part of its
+normal work (see orchestration/account_snapshot.py and
+evaluate_for_agent.py's cmd_evaluate), commits it, and pushes it back to
+the repo alongside the other logs. This script only ever reads that file
+(plus trade_log.jsonl/activity_log.jsonl/equity_history.jsonl) and,
+optionally, runs a plain `git pull` each cycle to sync in whatever the
+routine last pushed (see `_git_pull` -- disable with --no-pull). "Refresh"
+here means "re-read local disk," not "poll a live API" -- this can only
+ever be as fresh as the routine's last hourly push, never truer real-time
+than that.
 
 Trade history comes from orchestration/trade_log.py's local log file, not
 from Robinhood's own order history -- see that module's docstring for why.
@@ -27,13 +41,13 @@ It shows up here whether or not `broker.live_trading_enabled` is on:
 dry-run trades are logged too (clearly marked "SIMULATED"), so you can see
 what the strategy would have done before ever risking real money on it.
 
-Two more local logs feed this page, both new: `equity_history.jsonl` (one
-point appended per refresh cycle, right here, independent of whether
-run_live.py itself is running -- this is what draws the equity curve) and
-orchestration/activity_log.py's per-cycle, per-symbol log (every outcome,
-not just trades -- this is what backs the "today" narrative section, since
-trade_log.py alone can't say anything about the quiet cycles where nothing
-triggered, which is most of them at this project's confluence bar).
+Two more local logs feed this page: `equity_history.jsonl` (one point per
+routine cycle, appended by evaluate_for_agent.py, not by this file -- this
+is what draws the equity curve) and orchestration/activity_log.py's
+per-cycle, per-symbol log (every outcome, not just trades -- this is what
+backs the "today" narrative section, since trade_log.py alone can't say
+anything about the quiet cycles where nothing triggered, which is most of
+them at this project's confluence bar).
 
 Chart rendering is hand-rolled inline SVG, not a charting library -- no
 CDN, no network dependency, nothing that can silently fail to load on a
@@ -50,13 +64,12 @@ literally what brain/confluence.py looked at on its last cycle, not a
 one-line summary of it. It's a display of already-computed data, not a
 second opinion -- this file never recomputes indicators itself.
 
-Default refresh is 15s, not settings.yaml's monitoring.dashboard_refresh_seconds
-(5s) -- that default was sized for the full regime/signal loop, not for a
-standalone script hitting robin_stocks (unofficial, rate-limit-sensitive)
-with a burst of calls every cycle: account equity/buying power/positions/
-option positions/open orders, PLUS one fresh quote per open options
-position. Tighten it if you've confirmed your account doesn't get rate-
-limited at that cadence.
+Default refresh is 60s -- not settings.yaml's monitoring.dashboard_refresh_seconds
+(5s, sized for the old broker-polling loop), and not tied to any rate limit
+any more either, since there's no API being polled: it's just how often
+this re-reads local files (and, if --no-pull isn't set, runs `git pull`).
+Since the underlying data only actually changes once per hour anyway (the
+MCP routine's cadence), there's little reason to go much tighter than this.
 """
 from __future__ import annotations
 
@@ -69,24 +82,27 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from broker.robinhood_broker import RobinhoodBroker
 from data.news import AlpacaNewsFetcher, NewsItem
-from data.options_data import RobinhoodOptionChainFetcher
+from orchestration.account_snapshot import DEFAULT_EQUITY_HISTORY_PATH, DEFAULT_SNAPSHOT_PATH
+from orchestration.account_snapshot import EquityPoint, read_account_snapshot, read_equity_history
 from orchestration.activity_log import DEFAULT_LOG_PATH as DEFAULT_ACTIVITY_LOG_PATH
-from orchestration.activity_log import ActivityEntry, entries_for_date, prune_old_entries
+from orchestration.activity_log import ActivityEntry, entries_for_date
 from orchestration.activity_log import read_entries as read_activity_entries
 from orchestration.market_hours import MARKET_CLOSE, MARKET_OPEN, MARKET_TZ
-from orchestration.options_execution import OpenOptionPosition, build_open_positions_from_broker
+from orchestration.options_execution import OpenOptionPosition
 from orchestration.trade_grading import CheckPerformance, MIN_TRADES_FOR_AGGREGATE, TradeGrade, aggregate_check_performance, grade_trade
 from orchestration.trade_log import ClosedTrade, DEFAULT_LOG_PATH as DEFAULT_TRADE_LOG_PATH, build_trade_history, read_entries
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_PATH = Path(__file__).parent / "output" / "live_dashboard.html"
-DEFAULT_EQUITY_HISTORY_PATH = Path("equity_history.jsonl")
-DEFAULT_REFRESH_SECONDS = 15
+# Not a live-API polling interval any more -- see account_snapshot.py's
+# module docstring. This just controls how often the local repo checkout is
+# re-read and the HTML regenerated; the underlying data only actually
+# changes once per hour, when the MCP routine's next cycle pushes.
+DEFAULT_REFRESH_SECONDS = 60
 MAX_HISTORY_ROWS = 50            # most recent N closed trades shown in the table -- the log itself keeps everything
-MAX_EQUITY_POINTS = 600          # ~2.5 days of history at 15s intervals -- enough for the chart, bounded growth
+ACCOUNT_LABEL = "account ...9190"  # Robinhood "Agentic" account 954079190 -- fixed, not read from a broker any more
 
 # Display order + friendly labels for the confluence checklist -- keys must
 # match brain/confluence.py's `details` dict exactly (HARD_VETO_KEYS then
@@ -105,42 +121,6 @@ CONFLUENCE_CHECK_LABELS = [
     ("rsi_momentum", "RSI momentum"),
     ("volatility_expansion", "Volatility expansion"),
 ]
-
-
-@dataclass(frozen=True)
-class EquityPoint:
-    timestamp: str
-    equity: float
-
-
-def append_equity_point(point: EquityPoint, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(asdict(point)) + "\n")
-
-
-def read_equity_history(path: Path, max_points: int = MAX_EQUITY_POINTS) -> List[EquityPoint]:
-    if not path.exists():
-        return []
-    points: List[EquityPoint] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                points.append(EquityPoint(**json.loads(line)))
-            except (json.JSONDecodeError, TypeError):
-                continue
-    return points[-max_points:]
-
-
-def prune_equity_history(path: Path, keep: int = MAX_EQUITY_POINTS) -> None:
-    points = read_equity_history(path, max_points=keep + 1)
-    if len(points) <= keep:
-        return
-    trimmed = points[-keep:]
-    path.write_text("\n".join(json.dumps(asdict(p)) for p in trimmed) + "\n", encoding="utf-8")
 
 
 @dataclass
@@ -223,43 +203,44 @@ def _latest_per_symbol(entries: List[ActivityEntry]) -> List[ActivityEntry]:
 
 
 def fetch_snapshot(
-    broker: RobinhoodBroker,
-    chain_fetcher: RobinhoodOptionChainFetcher,
     stop_loss_pct: float,
     take_profit_pct: float,
     news_fetcher: Optional[AlpacaNewsFetcher] = None,
     trade_log_path: Path = DEFAULT_TRADE_LOG_PATH,
     activity_log_path: Path = DEFAULT_ACTIVITY_LOG_PATH,
     equity_history_path: Path = DEFAULT_EQUITY_HISTORY_PATH,
+    snapshot_path: Path = DEFAULT_SNAPSHOT_PATH,
 ) -> DashboardSnapshot:
-    equity = broker.get_portfolio_equity()
-    buying_power = broker.get_buying_power()
-    stock_positions = broker.get_positions()
-    raw_options = broker.get_option_positions()
-    open_positions = build_open_positions_from_broker(raw_options)
-    open_orders = broker.get_open_orders()
+    """Pure read of files the MCP routine already committed and pushed --
+    see orchestration/account_snapshot.py's module docstring for why this
+    is a read, never a broker or MCP call. This can only ever be as fresh
+    as the last `git pull` picked up from the routine's last push; it is
+    NOT a live feed in the sense the old robin_stocks version was.
+    """
+    account = read_account_snapshot(snapshot_path)
+    now = datetime.now(timezone.utc)
 
+    open_positions: Dict[str, OpenOptionPosition] = {}
     option_views: List[OptionPositionView] = []
-    for pos in open_positions.values():
-        try:
-            quote = chain_fetcher.get_quote_for_known_contract(pos.symbol, pos.option_type, pos.expiration_date, pos.strike_price)
-        except Exception:
-            logger.exception("%s: quote fetch failed this cycle", pos.symbol)
-            quote = None
+    if account is not None:
+        equity, buying_power, open_order_count = account.equity, account.buying_power, account.open_order_count
+        for p in account.option_positions:
+            pos = OpenOptionPosition(
+                symbol=p.symbol, option_type=p.option_type, strike_price=p.strike_price,
+                quantity=p.quantity, expiration_date=date.fromisoformat(p.expiration_date),
+                average_premium_paid=p.average_premium_paid,
+            )
+            open_positions[p.symbol] = pos
+            mid = (p.bid + p.ask) / 2 if (p.bid is not None and p.ask is not None) else None
+            spread_pct = ((p.ask - p.bid) / mid) if (mid and p.bid is not None and p.ask is not None) else None
+            option_views.append(OptionPositionView(pos, p.current_value, p.pnl_dollars, p.pnl_pct, p.bid, p.ask, spread_pct))
+    else:
+        equity, buying_power, open_order_count = 0.0, 0.0, 0
 
-        if quote is not None and quote.mid_price is not None:
-            current_value = quote.mid_price * pos.quantity * 100
-            entry_value = pos.average_premium_paid * pos.quantity * 100
-            pnl_dollars = current_value - entry_value
-            pnl_pct = (pnl_dollars / entry_value) if entry_value > 0 else None
-        else:
-            current_value, pnl_dollars, pnl_pct = None, None, None
-
-        bid = quote.bid if quote is not None else None
-        ask = quote.ask if quote is not None else None
-        spread_pct = ((ask - bid) / quote.mid_price) if (quote is not None and bid is not None and ask is not None and quote.mid_price) else None
-
-        option_views.append(OptionPositionView(pos, current_value, pnl_dollars, pnl_pct, bid, ask, spread_pct))
+    # This bot only ever trades options, never holds the underlying itself --
+    # always empty, same as it effectively always was under the old
+    # broker.get_positions() call too.
+    stock_positions: Dict[str, float] = {}
 
     try:
         closed_trades, _still_open = build_trade_history(read_entries(trade_log_path))
@@ -270,7 +251,6 @@ def fetch_snapshot(
     trade_grades = [grade_trade(t, stop_loss_pct, take_profit_pct) for t in closed_trades[:MAX_HISTORY_ROWS]]
     check_performance = aggregate_check_performance(closed_trades)
 
-    now = datetime.now(timezone.utc)
     try:
         all_activity_entries = read_activity_entries(activity_log_path)
         today_local = now.astimezone(MARKET_TZ).date()
@@ -300,21 +280,27 @@ def fetch_snapshot(
                 news_by_symbol[symbol] = items
 
     try:
-        append_equity_point(EquityPoint(timestamp=now.isoformat(), equity=equity), equity_history_path)
-        prune_equity_history(equity_history_path)
-        prune_old_entries(activity_log_path)
         equity_history = read_equity_history(equity_history_path)
     except Exception:
-        logger.exception("Failed to update equity history this cycle")
+        logger.exception("Failed to read equity history at %s this cycle", equity_history_path)
         equity_history = []
+
+    error = None
+    if account is None:
+        error = (
+            "No account_snapshot.json in this checkout yet -- run `git pull` after the MCP "
+            "routine's first cycle (it writes this file every run), or run `python -m "
+            "orchestration.evaluate_for_agent evaluate` once locally against real account state."
+        )
 
     return DashboardSnapshot(
         fetched_at=now, equity=equity, buying_power=buying_power, cash=None,
-        stock_positions=stock_positions, option_positions=option_views, open_order_count=len(open_orders),
+        stock_positions=stock_positions, option_positions=option_views, open_order_count=open_order_count,
         trade_history=closed_trades[:MAX_HISTORY_ROWS], equity_history=equity_history,
         today_significant_events=significant_events[:30], today_symbol_summaries=symbol_summaries,
         live_reasoning=live_reasoning, news_by_symbol=news_by_symbol,
         trade_grades=trade_grades, check_performance=check_performance,
+        error=error,
     )
 
 
@@ -1026,23 +1012,40 @@ def render_html(snapshot: DashboardSnapshot, refresh_seconds: int, account_label
 </html>"""
 
 
+def _git_pull() -> None:
+    """Best-effort sync with whatever the MCP routine's last cycle pushed.
+    Not a broker/MCP call -- a plain `git pull` against this repo's own
+    remote, same as a person would run by hand. Failure (no network, local
+    uncommitted changes, detached HEAD) is logged and swallowed rather than
+    crashing the refresh loop -- the dashboard just renders whatever's
+    already in the local checkout that cycle, same as if pull were skipped.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"], capture_output=True, text=True, timeout=30,
+            cwd=Path(__file__).resolve().parent.parent,
+        )
+        if result.returncode != 0:
+            logger.warning("git pull failed this cycle (non-fatal): %s", result.stderr.strip())
+    except Exception:
+        logger.exception("git pull raised this cycle (non-fatal)")
+
+
 def run_forever(
-    output_path: Path = DEFAULT_OUTPUT_PATH, refresh_seconds: int = DEFAULT_REFRESH_SECONDS, settings_path: str = "config/settings.yaml",
+    output_path: Path = DEFAULT_OUTPUT_PATH, refresh_seconds: int = DEFAULT_REFRESH_SECONDS,
+    settings_path: str = "config/settings.yaml", auto_pull: bool = True,
 ) -> None:
     # Settings loaded here only for stop_loss_pct/take_profit_pct, which
     # orchestration/trade_grading.py needs to bucket a closed trade's P&L
     # into "clean win"/"small loss"/etc against THIS account's actual
     # thresholds, not an arbitrary number picked in this file. Everything
-    # else this dashboard shows still comes straight from the broker/logs,
-    # not from settings -- it stays a read-only monitor either way.
+    # else this dashboard shows comes from committed repo files -- see
+    # fetch_snapshot's docstring -- never a broker or MCP call, so this
+    # stays a read-only monitor by construction, not just by convention.
     from config.config_loader import load_settings
     settings = load_settings(settings_path)
-
-    broker = RobinhoodBroker()
-    broker.connect()
-    broker.verify_account()
-    chain_fetcher = RobinhoodOptionChainFetcher()
-    account_label = f"account ...{broker.account_number[-4:]}"
 
     # Optional -- a missing/invalid Alpaca key shouldn't take down the whole
     # dashboard (it's already required for the live trading loop itself, but
@@ -1055,12 +1058,17 @@ def run_forever(
         news_fetcher = None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Writing %s every %ds. Open it in a browser and leave the tab open.", output_path, refresh_seconds)
+    logger.info(
+        "Writing %s every %ds (re-reading local files%s, no broker/MCP calls). Open it in a browser and leave the tab open.",
+        output_path, refresh_seconds, " + git pull" if auto_pull else "",
+    )
 
     last_good: Optional[DashboardSnapshot] = None
     while True:
+        if auto_pull:
+            _git_pull()
         try:
-            snapshot = fetch_snapshot(broker, chain_fetcher, settings.options.stop_loss_pct, settings.options.take_profit_pct, news_fetcher)
+            snapshot = fetch_snapshot(settings.options.stop_loss_pct, settings.options.take_profit_pct, news_fetcher)
             last_good = snapshot
         except Exception as exc:
             logger.exception("Dashboard refresh failed this cycle -- will retry next cycle")
@@ -1070,7 +1078,7 @@ def run_forever(
             snapshot = last_good
             snapshot.error = f"{type(exc).__name__}: {exc}"
 
-        output_path.write_text(render_html(snapshot, refresh_seconds, account_label), encoding="utf-8")
+        output_path.write_text(render_html(snapshot, refresh_seconds, ACCOUNT_LABEL), encoding="utf-8")
         time.sleep(refresh_seconds)
 
 
@@ -1088,5 +1096,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_PATH))
     parser.add_argument("--refresh-seconds", type=int, default=DEFAULT_REFRESH_SECONDS)
     parser.add_argument("--settings", default="config/settings.yaml")
+    parser.add_argument("--no-pull", action="store_true", help="Don't auto `git pull` each cycle -- just re-read whatever's on disk")
     args = parser.parse_args()
-    run_forever(Path(args.output), args.refresh_seconds, args.settings)
+    run_forever(Path(args.output), args.refresh_seconds, args.settings, auto_pull=not args.no_pull)

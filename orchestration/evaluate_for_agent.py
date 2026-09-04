@@ -61,6 +61,10 @@ import pandas as pd
 
 from config.config_loader import load_settings
 from data.options_data import OptionContract
+from orchestration.account_snapshot import (
+    AccountSnapshot, EquityPoint, SnapshotOptionPosition,
+    append_equity_point, prune_equity_history, write_account_snapshot,
+)
 from orchestration.activity_log import ActivityEntry
 from orchestration.activity_log import DEFAULT_LOG_PATH as DEFAULT_ACTIVITY_LOG_PATH
 from orchestration.activity_log import append_entry as append_activity_entry
@@ -153,6 +157,40 @@ def _parse_quotes(raw: dict) -> Dict[str, OptionContract]:
     return quotes
 
 
+def _build_account_snapshot(
+    equity: float, buying_power: float, open_positions: Dict[str, OpenOptionPosition],
+    open_position_quotes: Dict[str, OptionContract], open_order_symbols: list, now: datetime,
+) -> AccountSnapshot:
+    """Same current_value/pnl_dollars/pnl_pct math as
+    OptionsOrderExecutor._check_price_based_exit -- this just re-derives it
+    for display, it never feeds back into any decision. See
+    orchestration/account_snapshot.py's module docstring for why this
+    exists at all (letting the dashboard show this without ever calling
+    robin_stocks itself).
+    """
+    positions = []
+    for symbol, pos in open_positions.items():
+        quote = open_position_quotes.get(symbol)
+        if quote is not None and quote.mid_price is not None:
+            current_value = quote.mid_price * pos.quantity * 100
+            entry_value = pos.average_premium_paid * pos.quantity * 100
+            pnl_dollars = current_value - entry_value
+            pnl_pct = (pnl_dollars / entry_value) if entry_value > 0 else None
+            bid, ask = quote.bid, quote.ask
+        else:
+            current_value, pnl_dollars, pnl_pct, bid, ask = None, None, None, None, None
+        positions.append(SnapshotOptionPosition(
+            symbol=symbol, option_type=pos.option_type, strike_price=pos.strike_price,
+            quantity=pos.quantity, expiration_date=pos.expiration_date.isoformat(),
+            average_premium_paid=pos.average_premium_paid,
+            bid=bid, ask=ask, current_value=current_value, pnl_dollars=pnl_dollars, pnl_pct=pnl_pct,
+        ))
+    return AccountSnapshot(
+        fetched_at=now.isoformat(), equity=equity, buying_power=buying_power,
+        option_positions=positions, open_order_count=len(open_order_symbols),
+    )
+
+
 def cmd_evaluate(args: argparse.Namespace) -> None:
     """No market-data fetch happens in this process at all -- bars are
     supplied by the caller (the agent, via Robinhood MCP's
@@ -174,6 +212,17 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     open_order_symbols = payload.get("open_order_symbols", [])
 
     now = datetime.now(timezone.utc)
+
+    # Written every cycle, regardless of whether bars were supplied below --
+    # account state is already fully known at this point, and the dashboard
+    # (which reads these two files, never the broker) should reflect it even
+    # on a cycle that otherwise errors out before evaluating anything.
+    write_account_snapshot(_build_account_snapshot(
+        equity, buying_power, open_positions, open_position_quotes, open_order_symbols, now,
+    ))
+    append_equity_point(EquityPoint(timestamp=now.isoformat(), equity=equity))
+    prune_equity_history()
+
     intraday_bars = {}
     for symbol, records in payload.get("intraday_bars", {}).items():
         if records:

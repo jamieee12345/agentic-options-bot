@@ -13,8 +13,12 @@ dashboard/output/
 # Local backups made during earlier deploys -- not source
 *.bak
 
-# The three trade-history logs (trade_log.jsonl, activity_log.jsonl,
-# equity_history.jsonl) are DELIBERATELY NOT ignored -- see the MCP
-# migration plan: a scheduled cloud routine gets a fresh checkout every
-# firing, so committing these back to the repo each cycle is how state
-# persists across hourly runs. Do not add them here.
+# These four files (trade_log.jsonl, activity_log.jsonl,
+# equity_history.jsonl, account_snapshot.json) are DELIBERATELY NOT
+# ignored -- see the MCP migration plan: a scheduled cloud routine gets a
+# fresh checkout every firing, so committing these back to the repo each
+# cycle is how state persists across hourly runs. account_snapshot.json is
+# also what lets dashboard/live_account_dashboard.py show account state
+# without ever calling robin_stocks itself -- see
+# orchestration/account_snapshot.py's module docstring. Do not add any of
+# these here.
