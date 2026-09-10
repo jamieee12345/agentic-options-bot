@@ -112,6 +112,14 @@ class ConfluenceResult:
     applicable_checks: int
     veto_reason: Optional[str]
     details: Dict[str, str] = field(default_factory=dict)  # check name -> "pass"/"fail"/"n/a", for logging/debugging
+    # True only when one of the HARD vetoes fired (as opposed to `passed`
+    # being False because the soft score fell short). Callers deciding
+    # whether an OPEN position's thesis is broken (trend invalidation in
+    # orchestration/options_execution.py and the backtests) must use this,
+    # never `veto_reason`, which is set for the soft-score shortfall too --
+    # and never re-derive it from `details`, since which keys count as
+    # hard depends on `trend_veto_hard`.
+    hard_vetoed: bool = False
 
 
 def evaluate_confluence(
@@ -129,6 +137,7 @@ def evaluate_confluence(
     four_hour_bars: Optional[pd.DataFrame] = None,
     trend_1h_period: int = 20,
     trend_4h_period: int = 20,
+    trend_veto_hard: bool = True,
 ) -> ConfluenceResult:
     """`bars` drives every check except the trend reads -- for live,
     intraday-interval trading, `bars` is expected to be intraday (so
@@ -152,6 +161,16 @@ def evaluate_confluence(
     real information (a trade WITH the daily trend behind it is better
     evidenced than one without), it just no longer blocks a trade outright
     on its own.
+
+    `trend_veto_hard` selects the ROLE of trend_1h/trend_4h: True (the
+    default) makes each an outright veto as described above; False keeps
+    both computed and recorded but folds them into the soft score next to
+    trend_200sma instead. Exists because a 25-day SPY/QQQ A/B showed the
+    hard form removing every large winner in the window (FVG entries are
+    often reversal entries, which a 20-bar trend filter opposes by
+    construction) -- the toggle lets that be tested properly rather than
+    argued about. config/settings.yaml's options.trend_veto_hard is the
+    single source for it.
     """
     price = float(bars["close"].iloc[-1])
     swings = find_swing_points(bars)
@@ -196,9 +215,9 @@ def evaluate_confluence(
     details["elliott_wave"] = "fail" if (impulse.valid_impulse and impulse.impulse_direction == direction) else "n/a"
 
     veto_reason: Optional[str] = None
-    if details["trend_1h"] == "fail":
+    if trend_veto_hard and details["trend_1h"] == "fail":
         veto_reason = f"1-hour trend is {trend_1h.direction}, opposing a {direction} trade"
-    elif details["trend_4h"] == "fail":
+    elif trend_veto_hard and details["trend_4h"] == "fail":
         veto_reason = f"4-hour trend is {trend_4h.direction}, opposing a {direction} trade"
     elif details["market_structure"] == "fail":
         veto_reason = f"market structure is a clear {structure}, opposing a {direction} trade"
@@ -280,8 +299,9 @@ def evaluate_confluence(
     details["rsi_momentum"] = rsi_momentum_check(bars, direction, rsi_period)
     details["volatility_expansion"] = volatility_expansion_check(bars, atr_period)
 
-    passes = sum(1 for k in SOFT_CHECK_KEYS if details[k] == "pass")
-    fails = sum(1 for k in SOFT_CHECK_KEYS if details[k] == "fail")
+    soft_keys = SOFT_CHECK_KEYS if trend_veto_hard else SOFT_CHECK_KEYS + ("trend_1h", "trend_4h")
+    passes = sum(1 for k in soft_keys if details[k] == "pass")
+    fails = sum(1 for k in soft_keys if details[k] == "fail")
     applicable = passes + fails
     score = (passes / applicable) if applicable > 0 else None
 
@@ -290,7 +310,7 @@ def evaluate_confluence(
     # numbers, not None/0 placeholders, so a caller showing "everything we
     # looked at" can display them for reference even on a vetoed read.
     if veto_reason is not None:
-        return ConfluenceResult(False, score, applicable, veto_reason, details)
+        return ConfluenceResult(False, score, applicable, veto_reason, details, hard_vetoed=True)
 
     if applicable < min_applicable_checks:
         return ConfluenceResult(False, score, applicable, f"only {applicable} applicable confluence check(s), need >= {min_applicable_checks}", details)

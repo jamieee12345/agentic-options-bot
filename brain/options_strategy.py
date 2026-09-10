@@ -88,6 +88,7 @@ def decide_options_action(
     four_hour_bars: Optional[pd.DataFrame] = None,
     trend_1h_period: int = 20,
     trend_4h_period: int = 20,
+    trend_veto_hard: bool = True,
 ) -> OptionsDecision:
     """`bars` is whatever interval the live strategy is actually watching
     for FVG/momentum (intraday, for live trading -- see
@@ -121,6 +122,7 @@ def decide_options_action(
         fvg_lookback_period=lookback_period, fvg_body_multiplier=body_multiplier, daily_bars=daily_bars,
         hourly_bars=hourly_bars, four_hour_bars=four_hour_bars,
         trend_1h_period=trend_1h_period, trend_4h_period=trend_4h_period,
+        trend_veto_hard=trend_veto_hard,
     )
 
     if not confluence.passed:

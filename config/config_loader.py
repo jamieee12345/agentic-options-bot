@@ -166,6 +166,7 @@ class OptionsConfig:
     # consistently at each timeframe rather than picked per-timeframe.
     trend_1h_period: int
     trend_4h_period: int
+    trend_veto_hard: bool
     min_confluence_score: float
     # No longer live exit triggers -- see orchestration/options_execution.py's
     # _check_trend_invalidation, which replaced both with a single

@@ -34,6 +34,17 @@ Two details that matter for correctness:
   was still forming gets overwritten by its completed version next cycle
   -- merge keeps the newest copy of a timestamp -- so the cache
   self-heals instead of permanently holding a partial bar.
+* Backfill is BUDGETED and CHUNKED, never one-shot. Every bar the agent
+  fetches has to be re-emitted by the agent as output to reach Python,
+  and a full backfill (~6,500 bars for 10 symbols x 4 intervals) proved
+  to exhaust the account's 5-hour usage window mid-run -- twice. So
+  `plan_fetches` caps each cycle at MAX_BARS_PER_CYCLE: forward
+  increments for every symbol/interval come first (the bars that
+  actually matter for today's decision), then history is extended
+  BACKWARD one `chunk_days` slice at a time (5-minute first, then hour,
+  4hour, day) until each interval's backfill window is full. Until the
+  daily history fills in (~3-4 cycles) the 200-SMA soft check simply
+  reads "n/a" (fails open); the 1h/4h reads are complete after 1-2.
 * `drop_incomplete_last_bar` removes a bar whose interval hasn't elapsed
   yet at evaluation time. The FVG trigger keys off "the most recent bar";
   a half-formed 5-minute candle is not a confirmed gap, and the backtest
@@ -58,12 +69,20 @@ DEFAULT_CACHE_DIR = Path("market_data")
 MAX_BARS_PER_CALL = 300
 MAX_SYMBOLS_PER_CALL = 10
 
+# Soft cap on bars planned per CYCLE (the last call that crosses it is
+# still included, so a cycle plans at most this plus one call's worth).
+# Sized from evidence: the pre-cache routine re-emitted ~4,500 bars per
+# cycle and two such cycles exhausted a 5-hour window, so ~1,500 leaves
+# room for four-plus cycles per window with the agent's other work.
+MAX_BARS_PER_CYCLE = 1500
+
 
 @dataclass(frozen=True)
 class IntervalSpec:
     interval: str          # the exact get_equity_historicals `interval` value
     payload_key: str       # the key evaluate_for_agent's stdin payload uses for it
-    backfill_days: int     # calendar days to request when the cache is empty/stale
+    backfill_days: int     # calendar days of history to end up with (filled in over several cycles)
+    chunk_days: int        # calendar days fetched per backward-extension step
     retention_days: int    # calendar days to keep in the cache
     bars_per_day: float    # regular-session bars per trading day, for sizing calls
     bar_length: timedelta  # used to decide whether the latest bar is still forming
@@ -78,10 +97,10 @@ class IntervalSpec:
 # and 60 calendar days give ~100 and ~80 bars respectively; day feeds the
 # 200-SMA soft check, hence 400 calendar days (~252 trading days).
 INTERVAL_SPECS: Dict[str, IntervalSpec] = {
-    "5minute": IntervalSpec("5minute", "intraday_bars", backfill_days=3, retention_days=10, bars_per_day=78, bar_length=timedelta(minutes=5)),
-    "hour": IntervalSpec("hour", "hourly_bars", backfill_days=20, retention_days=45, bars_per_day=7, bar_length=timedelta(hours=1)),
-    "4hour": IntervalSpec("4hour", "four_hour_bars", backfill_days=60, retention_days=120, bars_per_day=2, bar_length=timedelta(hours=4)),
-    "day": IntervalSpec("day", "daily_bars", backfill_days=400, retention_days=420, bars_per_day=1, bar_length=timedelta(days=1)),
+    "5minute": IntervalSpec("5minute", "intraday_bars", backfill_days=3, chunk_days=1, retention_days=10, bars_per_day=78, bar_length=timedelta(minutes=5)),
+    "hour": IntervalSpec("hour", "hourly_bars", backfill_days=20, chunk_days=5, retention_days=45, bars_per_day=7, bar_length=timedelta(hours=1)),
+    "4hour": IntervalSpec("4hour", "four_hour_bars", backfill_days=60, chunk_days=16, retention_days=120, bars_per_day=2, bar_length=timedelta(hours=4)),
+    "day": IntervalSpec("day", "daily_bars", backfill_days=400, chunk_days=60, retention_days=420, bars_per_day=1, bar_length=timedelta(days=1)),
 }
 
 PAYLOAD_KEY_TO_INTERVAL = {spec.payload_key: spec.interval for spec in INTERVAL_SPECS.values()}
@@ -148,53 +167,92 @@ def drop_incomplete_last_bar(bars: Optional[pd.DataFrame], interval: str, now: d
 class FetchCall:
     symbols: List[str]
     interval: str
-    start_time: str          # RFC3339 UTC, ready to paste into get_equity_historicals
+    start_time: str            # RFC3339 UTC, ready to paste into get_equity_historicals
     payload_key: str
     estimated_bars: int
-    reason: str              # "backfill" (cache empty/stale) or "incremental"
+    reason: str                # "incremental" (new bars since last cycle) or "backfill" (extending history backward)
+    end_time: Optional[str] = None  # set on backward-extension calls only; pass through when present
 
 
 def _fmt(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _estimate_bars(spec: IntervalSpec, start: datetime, end: datetime) -> int:
+    span_days = max((end - start).total_seconds() / 86400.0, 0.0)
+    return int(span_days * spec.bars_per_day * (5.0 / 7.0)) + 2  # +2 slack: inclusive re-fetch + whatever formed since
+
+
+def _batch(symbols: List[str], spec: IntervalSpec, start: datetime, end: Optional[datetime], now: datetime, reason: str) -> List[FetchCall]:
+    per_symbol = _estimate_bars(spec, start, end or now)
+    per_call = max(1, min(MAX_SYMBOLS_PER_CALL, MAX_BARS_PER_CALL // max(per_symbol, 1)))
+    return [
+        FetchCall(
+            symbols=symbols[i:i + per_call], interval=spec.interval, start_time=_fmt(start), payload_key=spec.payload_key,
+            estimated_bars=per_symbol * len(symbols[i:i + per_call]), reason=reason,
+            end_time=_fmt(end) if end is not None else None,
+        )
+        for i in range(0, len(symbols), per_call)
+    ]
+
+
 def plan_fetches(
     symbols: Iterable[str], now: datetime, intervals: Iterable[str] = tuple(INTERVAL_SPECS),
-    cache_dir: Path = DEFAULT_CACHE_DIR,
+    cache_dir: Path = DEFAULT_CACHE_DIR, max_bars_per_cycle: int = MAX_BARS_PER_CYCLE,
 ) -> List[FetchCall]:
-    """The smallest set of get_equity_historicals calls that brings every
-    (symbol, interval) up to date. Symbols whose cache is at the same point
-    (the normal case -- they were all updated by the same previous cycle)
-    are batched into one call, up to MAX_BARS_PER_CALL / MAX_SYMBOLS_PER_CALL."""
-    calls: List[FetchCall] = []
+    """The get_equity_historicals calls for THIS cycle, in priority order,
+    under the per-cycle bar budget (see the module docstring):
+
+      1. incremental -- for every (symbol, interval) with a cache, the bars
+         since the last cached one (inclusive). Always planned; this is
+         the data today's decision actually depends on.
+      2. backfill -- for every (symbol, interval) whose history is shorter
+         than its backfill window, one chunk_days slice extending it
+         backward (or the most recent chunk, if the cache is empty).
+         Intervals in the order given (5minute, hour, 4hour, day), added
+         until the budget is crossed; the rest wait for the next cycle.
+
+    Symbols at the same point are batched into one call (up to
+    MAX_BARS_PER_CALL / MAX_SYMBOLS_PER_CALL)."""
+    symbols = [s.upper() for s in symbols]
+    incremental: List[FetchCall] = []
+    backfill: List[FetchCall] = []
     for interval in intervals:
         spec = INTERVAL_SPECS[interval]
-        # group symbols by the exact start_time they need
-        groups: Dict[str, Dict] = {}
+        target_start = now - timedelta(days=spec.backfill_days)
+        stale_cutoff = now - timedelta(days=spec.retention_days)
+        fwd_groups: Dict[str, Dict] = {}
+        back_groups: Dict[str, Dict] = {}
         for symbol in symbols:
             cached = load_cached(symbol, interval, cache_dir)
-            stale_cutoff = now - timedelta(days=spec.retention_days)
             if cached is None or cached.index[-1].to_pydatetime() < stale_cutoff:
-                start = now - timedelta(days=spec.backfill_days)
-                reason = "backfill"
-            else:
-                start = cached.index[-1].to_pydatetime()  # inclusive: re-fetch the last bar
-                reason = "incremental"
-            key = _fmt(start)
-            g = groups.setdefault(key, {"start": start, "reason": reason, "symbols": []})
-            g["symbols"].append(symbol.upper())
-        for key, g in sorted(groups.items()):
-            span_days = max((now - g["start"]).total_seconds() / 86400.0, 0.0)
-            # +2 bars of slack: the inclusive re-fetch plus whatever formed since
-            per_symbol = int(span_days * spec.bars_per_day * (5.0 / 7.0)) + 2
-            per_call = max(1, min(MAX_SYMBOLS_PER_CALL, MAX_BARS_PER_CALL // max(per_symbol, 1)))
-            syms = g["symbols"]
-            for i in range(0, len(syms), per_call):
-                chunk = syms[i:i + per_call]
-                calls.append(FetchCall(
-                    symbols=chunk, interval=interval, start_time=key, payload_key=spec.payload_key,
-                    estimated_bars=per_symbol * len(chunk), reason=g["reason"],
-                ))
+                # empty/stale: most recent chunk only (no end_time), history extends next cycle
+                start = max(target_start, now - timedelta(days=spec.chunk_days))
+                g = back_groups.setdefault((_fmt(start), None), {"start": start, "end": None, "symbols": []})
+                g["symbols"].append(symbol)
+                continue
+            last = cached.index[-1].to_pydatetime()
+            g = fwd_groups.setdefault(_fmt(last), {"start": last, "symbols": []})
+            g["symbols"].append(symbol)
+            earliest = cached.index[0].to_pydatetime()
+            if earliest > target_start + timedelta(days=spec.chunk_days):
+                start = max(target_start, earliest - timedelta(days=spec.chunk_days))
+                g = back_groups.setdefault((_fmt(start), _fmt(earliest)), {"start": start, "end": earliest, "symbols": []})
+                g["symbols"].append(symbol)
+        for key in sorted(fwd_groups):
+            g = fwd_groups[key]
+            incremental.extend(_batch(g["symbols"], spec, g["start"], None, now, "incremental"))
+        for key in sorted(back_groups, key=lambda k: (k[0], k[1] or "")):
+            g = back_groups[key]
+            backfill.extend(_batch(g["symbols"], spec, g["start"], g["end"], now, "backfill"))
+
+    calls = list(incremental)
+    planned = sum(c.estimated_bars for c in calls)
+    for call in backfill:
+        if planned >= max_bars_per_cycle:
+            break
+        calls.append(call)
+        planned += call.estimated_bars
     return calls
 
 

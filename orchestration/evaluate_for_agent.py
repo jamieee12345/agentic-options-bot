@@ -123,6 +123,7 @@ def _build_executor(settings) -> OptionsOrderExecutor:
         stagnant_exit_min_pnl_pct=opt.stagnant_exit_min_pnl_pct,
         max_hold_days=opt.max_hold_days,
         trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
+        trend_veto_hard=opt.trend_veto_hard,
         live_trading_enabled=settings.broker.live_trading_enabled,
     )
 
@@ -138,11 +139,14 @@ def cmd_fetch_plan(args: argparse.Namespace) -> None:
     belong in the `evaluate` payload. See orchestration/bar_cache.py."""
     settings = load_settings(args.settings)
     now = datetime.now(timezone.utc)
-    calls = plan_fetches(_watchlist(settings, args.symbols), now)
+    symbols = _watchlist(settings, args.symbols)
+    calls = plan_fetches(symbols, now)
     print(json.dumps({
         "now": now.isoformat(),
         "calls": [asdict(c) for c in calls],
         "estimated_total_bars": sum(c.estimated_bars for c in calls),
+        "incremental_calls": sum(1 for c in calls if c.reason == "incremental"),
+        "backfill_calls": sum(1 for c in calls if c.reason == "backfill"),
         "payload_keys": {spec.interval: spec.payload_key for spec in INTERVAL_SPECS.values()},
     }))
 

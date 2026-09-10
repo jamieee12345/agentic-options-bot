@@ -77,7 +77,7 @@ import pandas as pd
 
 from backtest.metrics import avg_win_loss, max_consecutive_losses, max_drawdown, profit_factor, win_rate
 from backtest.options_pricing import black_scholes_price, realized_volatility
-from brain.confluence import HARD_VETO_KEYS, evaluate_confluence
+from brain.confluence import evaluate_confluence
 from brain.options_strategy import decide_options_action
 from config.config_loader import Settings, load_settings
 from data.fetchers import YFinanceHistoricalFetcher
@@ -214,7 +214,7 @@ def run_symbol_backtest(
                 window, direction, sma_period=opt.sma_period, min_confluence_score=opt.min_confluence_score,
                 fvg_lookback_period=opt.fvg_lookback_period, fvg_body_multiplier=opt.fvg_body_multiplier,
             )
-            if any(confluence.details.get(k) == "fail" for k in HARD_VETO_KEYS):
+            if confluence.hard_vetoed:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "trend_invalidated"
                 open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
                 result.trades.append(open_trade)
@@ -403,8 +403,9 @@ def run_symbol_backtest_intraday(
                 daily_bars=daily_window if not daily_window.empty else None,
                 hourly_bars=hourly_window, four_hour_bars=four_hour_window,
                 trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
+                trend_veto_hard=opt.trend_veto_hard,
             )
-            if any(confluence.details.get(k) == "fail" for k in HARD_VETO_KEYS):
+            if confluence.hard_vetoed:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "trend_invalidated"
                 open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
                 result.trades.append(open_trade)
@@ -428,6 +429,7 @@ def run_symbol_backtest_intraday(
             min_gap_atr_multiplier=opt.fvg_min_gap_atr_multiplier,
             hourly_bars=hourly_window, four_hour_bars=four_hour_window,
             trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
+            trend_veto_hard=opt.trend_veto_hard,
         )
 
         if "no fair value gap" not in decision.reasoning and "didn't confirm it" not in decision.reasoning:
