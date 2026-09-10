@@ -209,10 +209,12 @@ options:
   # Role of the 1h/4h trend reads: true = each is an outright veto (the
   # design chosen 2026-09-09); false = both still computed and logged but
   # count toward the confluence score like trend_200sma instead of
-  # blocking. A 25-day SPY/QQQ A/B (see the commit that added this)
-  # showed the hard form filtering out every large winner in the window,
-  # so this exists to test that on the full watchlist before committing
-  # either way -- not a knob to search over.
+  # blocking. Tested 2026-09-10 on the full watchlist, 58 days of 5-minute
+  # bars, identical data both ways: hard -> 66 trades, PF 0.970; soft ->
+  # 237 trades, PF 0.966. A wash on edge, so the hard form stays (fewer
+  # trades = less unmodeled commission/slippage). Both are below 1.0 --
+  # the losses come from fvg_invalidated stops (0% win) and max_hold theta,
+  # not from this choice. Not a knob to search over.
   trend_veto_hard: true
 
   # Confluence gate (brain/confluence.py): require this fraction of

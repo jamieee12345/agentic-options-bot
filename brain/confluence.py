@@ -165,12 +165,12 @@ def evaluate_confluence(
     `trend_veto_hard` selects the ROLE of trend_1h/trend_4h: True (the
     default) makes each an outright veto as described above; False keeps
     both computed and recorded but folds them into the soft score next to
-    trend_200sma instead. Exists because a 25-day SPY/QQQ A/B showed the
-    hard form removing every large winner in the window (FVG entries are
-    often reversal entries, which a 20-bar trend filter opposes by
-    construction) -- the toggle lets that be tested properly rather than
-    argued about. config/settings.yaml's options.trend_veto_hard is the
-    single source for it.
+    trend_200sma instead. Added after a 25-day SPY/QQQ A/B suggested the
+    hard form was removing the large reversal winners; the full-watchlist
+    58-day A/B then showed it a wash (PF 0.970 hard vs 0.966 soft, on 66
+    vs 237 trades), so hard stays the default and the toggle remains for
+    honest re-testing. config/settings.yaml's options.trend_veto_hard is
+    the single source for it.
     """
     price = float(bars["close"].iloc[-1])
     swings = find_swing_points(bars)
