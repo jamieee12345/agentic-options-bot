@@ -10,8 +10,15 @@ Alpaca (which needed an API key with nowhere safe to store it in a
 routine's sandbox) was dropped in favor of the data source the agent
 already has authorized access to.
 
-Three subcommands, matching the three points in a cycle where the routine
-needs a verdict from tested Python instead of its own judgment:
+Four subcommands, matching the points in a cycle where the routine needs
+a verdict from tested Python instead of its own judgment:
+
+  fetch_plan   Print the exact get_equity_historicals calls the agent should
+               make this cycle -- only what's NEW since the last cycle, per
+               symbol and interval, computed against the git-persisted bar
+               cache in market_data/ (orchestration/bar_cache.py). This is
+               what keeps a steady-state cycle to ~25K characters of MCP
+               output instead of ~800K; see that module's docstring.
 
   evaluate     Run the full FVG+confluence pipeline (unchanged --
                brain/options_strategy.decide_options_action, the same
@@ -65,6 +72,9 @@ from orchestration.account_snapshot import (
     AccountSnapshot, EquityPoint, SnapshotOptionPosition,
     append_equity_point, prune_equity_history, write_account_snapshot,
 )
+from orchestration.bar_cache import (
+    INTERVAL_SPECS, PAYLOAD_KEY_TO_INTERVAL, load_all, merge_into_cache, plan_fetches,
+)
 from orchestration.activity_log import ActivityEntry
 from orchestration.activity_log import DEFAULT_LOG_PATH as DEFAULT_ACTIVITY_LOG_PATH
 from orchestration.activity_log import append_entry as append_activity_entry
@@ -74,26 +84,11 @@ from orchestration.trade_log import TradeLogEntry, append_entry as append_trade_
 from safety.options_sizing import compute_contract_count
 from safety.order_validation import DuplicateOrderGuard, run_order_checks
 
-# How far back the AGENT should request bars via Robinhood MCP's
-# get_equity_historicals before calling `evaluate` -- referenced by the
-# routine's own prompt, not used for fetching here (this script never
-# fetches market data itself in agent mode; see _bars_from_json below).
-#
-# Both numbers are shaped by a real constraint discovered empirically: a
-# get_equity_historicals result over ~100-150K characters gets rejected as
-# "exceeds maximum allowed tokens" by the MCP host. That rules out batching
-# multiple symbols per call for anything but a very short window (10 symbols
-# of 1-day daily bars is already too big), so the routine's prompt has the
-# agent fetch ONE SYMBOL AT A TIME for both daily and intraday. Within a
-# single symbol: 400 calendar days of daily bars (~252 trading days) comes
-# back around 45K characters -- comfortable. 5-minute bars are far denser
-# (~11-12K characters/trading day), so INTRADAY_LOOKBACK_DAYS is deliberately
-# small -- this project's own confluence/FVG windows only look back 10-20
-# BARS (see run_live.py's ALPACA_INTRADAY_LOOKBACK_DAYS comment), so 3
-# trading days (~234 bars, ~35K characters) is already generous headroom,
-# not a tight fit.
-DAILY_LOOKBACK_DAYS = 400
-INTRADAY_LOOKBACK_DAYS = 3
+# How far back each interval is fetched/retained now lives in
+# orchestration/bar_cache.INTERVAL_SPECS -- `fetch_plan` below turns that
+# into the concrete get_equity_historicals calls for THIS cycle (usually a
+# handful of bars per symbol, since the cache in market_data/ already holds
+# the history). This script still never fetches market data itself.
 
 
 def _bars_from_json(records: list) -> pd.DataFrame:
@@ -127,8 +122,29 @@ def _build_executor(settings) -> OptionsOrderExecutor:
         stagnant_exit_hold_fraction=opt.stagnant_exit_hold_fraction,
         stagnant_exit_min_pnl_pct=opt.stagnant_exit_min_pnl_pct,
         max_hold_days=opt.max_hold_days,
+        trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
         live_trading_enabled=settings.broker.live_trading_enabled,
     )
+
+
+def _watchlist(settings, override: Optional[list]) -> list:
+    return [s.upper() for s in (override or settings.broker.core_watchlist)]
+
+
+def cmd_fetch_plan(args: argparse.Namespace) -> None:
+    """Prints the get_equity_historicals calls the agent should make this
+    cycle. Each entry maps straight onto one MCP call (symbols, interval,
+    start_time) and names the stdin `payload_key` under which its bars
+    belong in the `evaluate` payload. See orchestration/bar_cache.py."""
+    settings = load_settings(args.settings)
+    now = datetime.now(timezone.utc)
+    calls = plan_fetches(_watchlist(settings, args.symbols), now)
+    print(json.dumps({
+        "now": now.isoformat(),
+        "calls": [asdict(c) for c in calls],
+        "estimated_total_bars": sum(c.estimated_bars for c in calls),
+        "payload_keys": {spec.interval: spec.payload_key for spec in INTERVAL_SPECS.values()},
+    }))
 
 
 def _parse_open_positions(raw: list) -> Dict[str, OpenOptionPosition]:
@@ -201,8 +217,15 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     routine's own prompt for why Alpaca (which needed an API key with
     nowhere safe to store it in a routine's environment) was dropped in
     favor of the data source the agent already has authorized access to.
+
+    The payload's bars are normally just the DELTA since last cycle (see
+    `fetch_plan`): they're merged into the market_data/ cache first, and
+    the evaluation runs on the full cached window, never on the delta
+    alone. A payload carrying full history (the old routine prompt's
+    shape) still works identically -- merge is a union.
     """
     settings = load_settings(args.settings)
+    symbols = _watchlist(settings, args.symbols)
 
     payload = json.load(sys.stdin)
     equity = float(payload["equity"])
@@ -223,29 +246,40 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     append_equity_point(EquityPoint(timestamp=now.isoformat(), equity=equity))
     prune_equity_history()
 
-    intraday_bars = {}
-    for symbol, records in payload.get("intraday_bars", {}).items():
-        if records:
-            intraday_bars[symbol] = _bars_from_json(records)
-    daily_bars = {}
-    for symbol, records in payload.get("daily_bars", {}).items():
-        if records:
-            daily_bars[symbol] = _bars_from_json(records)
+    # Merge whatever the agent fetched this cycle into the cache, then
+    # evaluate on the cache (full retained window, still-forming last bar
+    # dropped) -- see orchestration/bar_cache.py.
+    cache_files_written = []
+    for payload_key, interval in PAYLOAD_KEY_TO_INTERVAL.items():
+        fresh = {}
+        for symbol, records in (payload.get(payload_key) or {}).items():
+            if records:
+                fresh[symbol.upper()] = _bars_from_json(records)
+        if fresh:
+            cache_files_written.extend(str(p) for p in merge_into_cache(fresh, interval, now).values())
+
+    intraday_bars = load_all(symbols, "5minute", now)
+    hourly_bars = load_all(symbols, "hour", now)
+    four_hour_bars = load_all(symbols, "4hour", now)
+    daily_bars = load_all(symbols, "day", now)
 
     if not intraday_bars:
-        print(json.dumps({"live_trading_enabled": settings.broker.live_trading_enabled, "fetched_at": now.isoformat(), "records": [], "error": "no intraday_bars supplied in the payload for any symbol"}))
+        print(json.dumps({"live_trading_enabled": settings.broker.live_trading_enabled, "fetched_at": now.isoformat(), "records": [], "cache_files_written": cache_files_written, "error": "no 5-minute bars available for any symbol (neither in the payload nor cached in market_data/)"}))
         return
 
     executor = _build_executor(settings)
     records = executor.run(
         bars=intraday_bars, equity=equity, open_positions=open_positions, buying_power=buying_power,
         open_order_symbols=open_order_symbols, now=now, daily_bars=daily_bars,
+        hourly_bars=hourly_bars, four_hour_bars=four_hour_bars,
         open_position_quotes=open_position_quotes,
     )
 
     print(json.dumps({
         "live_trading_enabled": settings.broker.live_trading_enabled,
         "fetched_at": now.isoformat(),
+        "cache_files_written": cache_files_written,
+        "bars_available": {s: {"5minute": len(intraday_bars.get(s, ())), "hour": len(hourly_bars.get(s, ())), "4hour": len(four_hour_bars.get(s, ())), "day": len(daily_bars.get(s, ()))} for s in symbols},
         "records": [asdict(r) for r in records],
     }, default=str))
 
@@ -316,6 +350,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_plan = sub.add_parser("fetch_plan", help="Print the get_equity_historicals calls needed to bring market_data/ up to date")
+    p_plan.add_argument("--symbols", nargs="*", default=None, help="Defaults to settings.yaml's broker.core_watchlist")
+    p_plan.add_argument("--settings", default="config/settings.yaml")
+    p_plan.set_defaults(func=cmd_fetch_plan)
 
     p_eval = sub.add_parser("evaluate", help="Run the decision pipeline; account state comes from stdin JSON")
     p_eval.add_argument("--symbols", nargs="*", default=None, help="Defaults to settings.yaml's broker.core_watchlist")

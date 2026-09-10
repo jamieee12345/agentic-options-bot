@@ -154,6 +154,7 @@ def build_executor(broker: RobinhoodBroker, chain_fetcher: RobinhoodOptionChainF
         stagnant_exit_hold_fraction=opt.stagnant_exit_hold_fraction,
         stagnant_exit_min_pnl_pct=opt.stagnant_exit_min_pnl_pct,
         max_hold_days=opt.max_hold_days,
+        trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
         # NOTE: this flag lives under settings.yaml's broker: section, not
         # options: -- it's a single shared kill switch for both pipelines,
         # not a separate one per asset class.

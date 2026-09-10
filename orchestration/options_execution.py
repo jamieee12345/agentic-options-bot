@@ -211,6 +211,8 @@ class OptionsOrderExecutor:
         stagnant_exit_hold_fraction: float,
         stagnant_exit_min_pnl_pct: float,
         max_hold_days: int,
+        trend_1h_period: int = 20,
+        trend_4h_period: int = 20,
         live_trading_enabled: bool = False,
         duplicate_guard: Optional[DuplicateOrderGuard] = None,
         trade_log_path: Path = DEFAULT_LOG_PATH,
@@ -231,6 +233,10 @@ class OptionsOrderExecutor:
         self.fvg_min_gap_atr_multiplier = fvg_min_gap_atr_multiplier
         self.sma_period = sma_period
         self.min_confluence_score = min_confluence_score
+        # SMA lengths for the 1h/4h hard-veto trend reads (brain/confluence.py)
+        # -- both entry gating and _check_trend_invalidation use these.
+        self.trend_1h_period = trend_1h_period
+        self.trend_4h_period = trend_4h_period
         # "Close if going nowhere" -- see the class/module docstrings for
         # why. Only ever reached after trend invalidation didn't already
         # fire this bar (see _check_stagnation_exit).
@@ -253,13 +259,19 @@ class OptionsOrderExecutor:
         open_order_symbols: List[str],
         now: datetime,
         daily_bars: Optional[Dict[str, pd.DataFrame]] = None,
+        hourly_bars: Optional[Dict[str, pd.DataFrame]] = None,
+        four_hour_bars: Optional[Dict[str, pd.DataFrame]] = None,
         open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
     ) -> List[OptionsExecutionRecord]:
         """`bars` drives FVG/structure/S-R/etc -- pass intraday bars here for
         live trading so the strategy reacts within the trading day, not just
-        once it closes. `daily_bars`, if given, is used only for the 200-SMA
-        trend veto per symbol (see brain/confluence.py's docstring for why
-        that stays on a daily interval regardless of what `bars` is).
+        once it closes. `daily_bars`/`hourly_bars`/`four_hour_bars`, if
+        given, each feed a separate trend read per symbol inside
+        evaluate_confluence -- see brain/confluence.py's docstring for why
+        there are three (1h/4h are the hard-veto trend checks now, matched
+        to this strategy's own 1-2 DTE holding period; daily is a soft
+        check only). Any of the three can be omitted -- that trend read
+        just reports "n/a" (fails open) rather than erroring.
 
         `open_position_quotes` is AGENT MODE ONLY (ignored in broker mode,
         which fetches its own quotes via chain_fetcher): a fresh quote per
@@ -314,6 +326,7 @@ class OptionsOrderExecutor:
 
                 trend_record = self._check_trend_invalidation(
                     symbol, existing, symbol_bars, (daily_bars or {}).get(symbol), now, open_order_symbols, open_position_quotes,
+                    hourly_bars_for_symbol=(hourly_bars or {}).get(symbol), four_hour_bars_for_symbol=(four_hour_bars or {}).get(symbol),
                 )
                 if trend_record is not None:
                     records.append(trend_record)
@@ -330,6 +343,8 @@ class OptionsOrderExecutor:
                 symbol, symbol_bars, self.fvg_lookback_period, self.fvg_body_multiplier, self.fvg_volume_multiplier,
                 self.sma_period, self.min_confluence_score,
                 daily_bars=(daily_bars or {}).get(symbol), min_gap_atr_multiplier=self.fvg_min_gap_atr_multiplier,
+                hourly_bars=(hourly_bars or {}).get(symbol), four_hour_bars=(four_hour_bars or {}).get(symbol),
+                trend_1h_period=self.trend_1h_period, trend_4h_period=self.trend_4h_period,
             )
             # Every branch below that stems from `decision` (not from an
             # executor-level position-management check above) carries the
@@ -448,9 +463,10 @@ class OptionsOrderExecutor:
     def _check_trend_invalidation(
         self, symbol, existing: OpenOptionPosition, symbol_bars: pd.DataFrame, daily_bars_for_symbol: Optional[pd.DataFrame],
         now, open_order_symbols, open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
+        hourly_bars_for_symbol: Optional[pd.DataFrame] = None, four_hour_bars_for_symbol: Optional[pd.DataFrame] = None,
     ) -> Optional[OptionsExecutionRecord]:
         """Re-runs the SAME hard-veto checks (brain/confluence.py's
-        trend_200sma/market_structure/elliott_wave) that would have
+        trend_1h/trend_4h/market_structure/elliott_wave) that would have
         BLOCKED opening this position fresh right now, against the
         position's own direction -- exact same call brain/options_strategy.py
         makes for a fresh entry, just with the direction fixed to whatever
@@ -472,7 +488,7 @@ class OptionsOrderExecutor:
         too few soft checks are applicable. Those are normal, expected
         states for an already-open position (soft checks drift constantly)
         and were explicitly NOT what "trend broke" was meant to mean here
-        -- so this checks `details` for the three HARD_VETO_KEYS
+        -- so this checks `details` for the four HARD_VETO_KEYS
         specifically. When one of them IS the failure, evaluate_confluence
         returns immediately on that branch (before ever reaching the
         soft-score logic), so `result.veto_reason` is guaranteed to be
@@ -485,6 +501,8 @@ class OptionsOrderExecutor:
             symbol_bars, direction, sma_period=self.sma_period, min_confluence_score=self.min_confluence_score,
             fvg_lookback_period=self.fvg_lookback_period, fvg_body_multiplier=self.fvg_body_multiplier,
             daily_bars=daily_bars_for_symbol,
+            hourly_bars=hourly_bars_for_symbol, four_hour_bars=four_hour_bars_for_symbol,
+            trend_1h_period=self.trend_1h_period, trend_4h_period=self.trend_4h_period,
         )
         if any(result.details.get(k) == "fail" for k in HARD_VETO_KEYS):
             return self._close(

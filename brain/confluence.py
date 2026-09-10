@@ -14,30 +14,40 @@ backtested that EXACT rule set is not telling you something well-founded.
 More checks agreeing is evidence, not a guarantee -- there is no
 confluence bar, however strict, that makes every trade a winner. What this
 system CAN honestly do is take fewer, better-supported trades and cap the
-damage on the ones that are wrong anyway (see stop_loss_pct/take_profit_pct
-in orchestration/options_execution.py) -- that is the real, achievable
-version of "limited risk," not a rule set that never loses.
+damage on the ones that are wrong anyway (see
+orchestration/options_execution.py's trend-invalidation exit, which closes
+a position once ITS OWN hard vetoes flip against it) -- that is the real,
+achievable version of "limited risk," not a rule set that never loses.
 
 Two tiers, deliberately different from each other:
 
   HARD VETOES -- any one true blocks the trade outright, no matter how the
   soft checks below score. These are the "we should never fight this"
-  conditions: trading against the 200-day trend, trading against a clear
-  opposing market structure trend, or entering right as Elliott Wave rules
-  say a same-direction impulse just completed (i.e., chasing exhaustion).
+  conditions: trading against the 1-hour or 4-hour trend (see
+  trend_1h_period/trend_4h_period -- timeframes chosen to match this
+  strategy's own 1-2 DTE / max-one-overnight holding period, NOT the
+  200-day daily trend, which was the original hard veto here until it
+  turned out to block same-day setups just because the multi-month daily
+  chart disagreed, even though the trade would resolve long before that
+  daily trend could matter), trading against a clear opposing market
+  structure trend, or entering right as Elliott Wave rules say a
+  same-direction impulse just completed (i.e., chasing exhaustion).
 
   SOFT CONFLUENCE CHECKS -- break of structure, support/resistance,
   supply/demand, a liquidity sweep, VPVR (volume profile) value-area
   breakout, VPVR node quality (a second read of the same profile -- see
-  brain/volume_profile.node_quality_check), RSI momentum, and ATR
-  volatility expansion. Each is pass / fail / not-applicable (e.g., "no
-  supply/demand zone nearby" is not-applicable, not a fail -- there's
-  nothing to disagree with). The score is pass / (pass + fail) among only
-  the applicable checks. Requires both a minimum score (settings.yaml:
-  options.min_confluence_score) AND a minimum number of applicable checks,
-  so a technically-perfect score from only one or two lucky applicable
-  checks can't pass on its own -- shallow confluence is chosen not to
-  count as real confluence.
+  brain/volume_profile.node_quality_check), RSI momentum, ATR volatility
+  expansion, and the 200-day daily trend (demoted from a hard veto -- see
+  above -- to one vote among several: still real evidence, a trade WITH
+  the long-term trend behind it is better-supported than one without, it
+  just no longer blocks a trade outright on its own). Each is pass / fail
+  / not-applicable (e.g., "no supply/demand zone nearby" is
+  not-applicable, not a fail -- there's nothing to disagree with). The
+  score is pass / (pass + fail) among only the applicable checks. Requires
+  both a minimum score (settings.yaml: options.min_confluence_score) AND a
+  minimum number of applicable checks, so a technically-perfect score from
+  only one or two lucky applicable checks can't pass on its own -- shallow
+  confluence is chosen not to count as real confluence.
 """
 from __future__ import annotations
 
@@ -68,19 +78,30 @@ DEFAULT_MIN_CONFLUENCE_SCORE = 0.6
 DEFAULT_MIN_APPLICABLE_CHECKS = 3
 DEFAULT_SR_BLOCK_DISTANCE_PCT = 0.005  # a level within 0.5% of price counts as "immediately in the way"
 
-# The three hard-veto checks, kept separate from the soft ones below so the
+# The four hard-veto checks, kept separate from the soft ones below so the
 # score (passes / applicable) only ever counts the soft checks -- exactly
 # the original semantics, even though `details` now always carries every
 # key (hard + soft) for the dashboard's live-reasoning display.
-HARD_VETO_KEYS = ("trend_200sma", "market_structure", "elliott_wave")
+#
+# trend_1h/trend_4h replaced trend_200sma here on request: this strategy
+# closes every position within at most one overnight (max_hold_days), so
+# the DAILY 200-SMA was never the relevant trend read for it -- it could
+# (and did) block a perfectly good same-day setup just because the
+# multi-month daily chart disagreed, even though the trade would resolve
+# long before that daily trend could matter. trend_200sma is still
+# computed -- see SOFT_CHECK_KEYS below -- just no longer an absolute
+# blocker on its own.
+HARD_VETO_KEYS = ("trend_1h", "trend_4h", "market_structure", "elliott_wave")
 # rsi_momentum and volatility_expansion added on request ("multiple [more]
 # checks to confirm trades") -- both read genuinely different signals
-# (momentum, volatility) than the other five, which all read price
+# (momentum, volatility) than the other checks, which all read price
 # structure off the same series, so they're additive rather than
-# duplicating an existing vote.
+# duplicating an existing vote. trend_200sma joined this list (demoted
+# from HARD_VETO_KEYS above) -- still counts toward the score, no longer
+# vetoes on its own.
 SOFT_CHECK_KEYS = (
     "break_of_structure", "support_resistance", "supply_demand", "liquidity_sweep", "volume_profile",
-    "rsi_momentum", "volatility_expansion", "vpvr_node_quality",
+    "rsi_momentum", "volatility_expansion", "vpvr_node_quality", "trend_200sma",
 )
 
 
@@ -104,16 +125,33 @@ def evaluate_confluence(
     daily_bars: Optional[pd.DataFrame] = None,
     rsi_period: int = DEFAULT_RSI_PERIOD,
     atr_period: int = DEFAULT_ATR_PERIOD,
+    hourly_bars: Optional[pd.DataFrame] = None,
+    four_hour_bars: Optional[pd.DataFrame] = None,
+    trend_1h_period: int = 20,
+    trend_4h_period: int = 20,
 ) -> ConfluenceResult:
-    """`bars` drives every check except the 200-SMA trend veto -- for live,
+    """`bars` drives every check except the trend reads -- for live,
     intraday-interval trading, `bars` is expected to be intraday (so
     market structure/S-R/supply-demand/liquidity/volume-profile/Elliott-Wave
-    all reflect CURRENT price action, not yesterday's close), while
-    `daily_bars` (falls back to `bars` if omitted, e.g. for the backtester,
-    which only ever has daily bars anyway) keeps the SMA200 filter meaning
-    what it's supposed to mean -- the past 200 DAYS, not 200 five-minute
-    bars, which would only be a couple of trading days and defeat the
-    entire point of a long-term trend filter.
+    all reflect CURRENT price action, not yesterday's close).
+
+    TREND, PLURAL, ON PURPOSE: this strategy trades 1-2 DTE contracts,
+    closed within at most one overnight (orchestration/options_execution.py's
+    max_hold_days) -- a position never lives long enough for the DAILY
+    200-SMA to be the relevant trend read. Originally that was the only
+    trend check, and a HARD VETO: a same-day bearish setup got blocked
+    outright just because the daily chart was in a multi-month uptrend,
+    even though the position would be closed well before that daily trend
+    could possibly matter. Fixed by re-anchoring the hard veto on
+    timeframes actually matched to the holding period -- `hourly_bars`
+    and `four_hour_bars`, both required for `trend_1h`/`trend_4h` to be
+    anything but "n/a" (fail OPEN, not a silent veto, if a caller doesn't
+    supply them). `daily_bars` (falls back to `bars` if omitted, e.g. for
+    the daily backtester) still feeds `trend_200sma` -- kept, not thrown
+    away, just demoted to a SOFT check: the long-term backdrop is still
+    real information (a trade WITH the daily trend behind it is better
+    evidenced than one without), it just no longer blocks a trade outright
+    on its own.
     """
     price = float(bars["close"].iloc[-1])
     swings = find_swing_points(bars)
@@ -124,14 +162,20 @@ def evaluate_confluence(
     # end up firing -- so a caller displaying "everything we looked at" (the
     # dashboard's live-reasoning panel) sees the full picture, not just
     # whichever single check happened to trip first. The veto DECISION
-    # itself (which trade this blocks) is unchanged from before: any one of
-    # these three being unfavorable still blocks the trade outright.
+    # itself: any one of these four being unfavorable blocks the trade
+    # outright.
 
-    trend = sma_trend(daily_bars if daily_bars is not None else bars, sma_period)
-    if trend.direction is None:
-        details["trend_200sma"] = "n/a"
+    trend_1h = sma_trend(hourly_bars, trend_1h_period) if hourly_bars is not None else None
+    if trend_1h is None or trend_1h.direction is None:
+        details["trend_1h"] = "n/a"
     else:
-        details["trend_200sma"] = "pass" if trend.direction == direction else "fail"
+        details["trend_1h"] = "pass" if trend_1h.direction == direction else "fail"
+
+    trend_4h = sma_trend(four_hour_bars, trend_4h_period) if four_hour_bars is not None else None
+    if trend_4h is None or trend_4h.direction is None:
+        details["trend_4h"] = "n/a"
+    else:
+        details["trend_4h"] = "pass" if trend_4h.direction == direction else "fail"
 
     structure = classify_structure(swings)
     opposing_structure = {"bullish": "downtrend", "bearish": "uptrend"}[direction]
@@ -152,8 +196,10 @@ def evaluate_confluence(
     details["elliott_wave"] = "fail" if (impulse.valid_impulse and impulse.impulse_direction == direction) else "n/a"
 
     veto_reason: Optional[str] = None
-    if details["trend_200sma"] == "fail":
-        veto_reason = f"200-SMA (daily) trend is {trend.direction}, opposing a {direction} trade"
+    if details["trend_1h"] == "fail":
+        veto_reason = f"1-hour trend is {trend_1h.direction}, opposing a {direction} trade"
+    elif details["trend_4h"] == "fail":
+        veto_reason = f"4-hour trend is {trend_4h.direction}, opposing a {direction} trade"
     elif details["market_structure"] == "fail":
         veto_reason = f"market structure is a clear {structure}, opposing a {direction} trade"
     elif details["elliott_wave"] == "fail":
@@ -161,6 +207,15 @@ def evaluate_confluence(
             f"a {direction} Elliott-Wave-rule-valid impulse just completed -- "
             "entering now would be chasing exhaustion, not the move"
         )
+
+    # Daily 200-SMA: still computed, no longer a veto -- see module
+    # docstring above for why. Folds into the SOFT_CHECK_KEYS score below
+    # like any other soft check.
+    trend_200sma = sma_trend(daily_bars if daily_bars is not None else bars, sma_period)
+    if trend_200sma.direction is None:
+        details["trend_200sma"] = "n/a"
+    else:
+        details["trend_200sma"] = "pass" if trend_200sma.direction == direction else "fail"
 
     # --- soft confluence checks ---------------------------------------------
     # Computed unconditionally too (even on a hard veto) -- cheap relative to

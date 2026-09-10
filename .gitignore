@@ -22,3 +22,9 @@ dashboard/output/
 # without ever calling robin_stocks itself -- see
 # orchestration/account_snapshot.py's module docstring. Do not add any of
 # these here.
+#
+# market_data/ (one CSV per symbol per bar interval) is likewise tracked on
+# purpose: it's the bar cache orchestration/bar_cache.py maintains so each
+# routine cycle only fetches bars that are NEW since the previous cycle
+# (~30x less MCP output per cycle). Bounded by per-interval retention, so
+# it stays small.

@@ -157,6 +157,15 @@ class OptionsConfig:
     # largest loss bucket by trade count).
     fvg_min_gap_atr_multiplier: float
     sma_period: int
+    # SMA periods for the two HARD-VETO trend checks (brain/confluence.py's
+    # trend_1h/trend_4h) -- timeframes chosen to match this strategy's own
+    # 1-2 DTE / max-one-overnight holding period, replacing the daily
+    # 200-SMA as the hard veto (that's demoted to a soft check now, see
+    # sma_period below and brain/confluence.py's module docstring). 20 on
+    # both is a simple, standard SMA convention -- not tuned, just applied
+    # consistently at each timeframe rather than picked per-timeframe.
+    trend_1h_period: int
+    trend_4h_period: int
     min_confluence_score: float
     # No longer live exit triggers -- see orchestration/options_execution.py's
     # _check_trend_invalidation, which replaced both with a single
@@ -226,6 +235,10 @@ class OptionsConfig:
             raise ConfigError(f"options.fvg_min_gap_atr_multiplier ({self.fvg_min_gap_atr_multiplier}) must be non-negative")
         if self.sma_period <= 0:
             raise ConfigError(f"options.sma_period ({self.sma_period}) must be positive")
+        if self.trend_1h_period <= 0:
+            raise ConfigError(f"options.trend_1h_period ({self.trend_1h_period}) must be positive")
+        if self.trend_4h_period <= 0:
+            raise ConfigError(f"options.trend_4h_period ({self.trend_4h_period}) must be positive")
         if not (0 < self.min_confluence_score <= 1.0):
             raise ConfigError(f"options.min_confluence_score ({self.min_confluence_score}) must be in (0, 1]")
         if not (0 < self.stop_loss_pct <= 1.0):

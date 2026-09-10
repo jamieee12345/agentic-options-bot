@@ -185,9 +185,27 @@ options:
   # for against that backtest's results.
   fvg_min_gap_atr_multiplier: 0.5
 
-  # Long-term trend filter (brain/trend_indicators.py). A hard veto in the
-  # confluence gate: never trade against this.
+  # Long-term (daily) trend filter (brain/trend_indicators.py). NO LONGER
+  # a hard veto -- see trend_1h_period/trend_4h_period below for why, and
+  # brain/confluence.py's module docstring for the full reasoning. Still
+  # computed and still counts toward the confluence score (a trade WITH
+  # the daily trend behind it is better-supported than one against it),
+  # just no longer an absolute blocker on its own.
   sma_period: 200
+
+  # THE hard-veto trend checks now, on request: this strategy closes every
+  # position within at most one overnight (max_hold_days), so the daily
+  # 200-SMA above was never the relevant trend for it -- it blocked
+  # same-day setups just because the multi-month daily chart disagreed,
+  # even though the trade would resolve long before that daily trend
+  # could matter. 1h and 4h are timeframes actually matched to a 1-2 day
+  # hold; either one opposing the trade direction blocks it outright, same
+  # as market_structure/elliott_wave already did. Both periods are 20 --
+  # a simple, standard SMA convention applied consistently at each
+  # timeframe rather than picked per-timeframe, not a value searched for
+  # against a backtest.
+  trend_1h_period: 20
+  trend_4h_period: 20
 
   # Confluence gate (brain/confluence.py): require this fraction of
   # applicable SOFT checks (break-of-structure, S/R, supply/demand,
