@@ -77,7 +77,7 @@ import pandas as pd
 
 from backtest.metrics import avg_win_loss, max_consecutive_losses, max_drawdown, profit_factor, win_rate
 from backtest.options_pricing import black_scholes_price, realized_volatility
-from brain.confluence import HARD_VETO_KEYS, evaluate_confluence
+from brain.confluence import evaluate_confluence
 from brain.options_strategy import decide_options_action
 from config.config_loader import Settings, load_settings
 from data.fetchers import YFinanceHistoricalFetcher
@@ -214,7 +214,7 @@ def run_symbol_backtest(
                 window, direction, sma_period=opt.sma_period, min_confluence_score=opt.min_confluence_score,
                 fvg_lookback_period=opt.fvg_lookback_period, fvg_body_multiplier=opt.fvg_body_multiplier,
             )
-            if any(confluence.details.get(k) == "fail" for k in HARD_VETO_KEYS):
+            if confluence.hard_vetoed:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "trend_invalidated"
                 open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
                 result.trades.append(open_trade)
@@ -287,6 +287,30 @@ DEFAULT_INTRADAY_WARMUP_BARS = 30  # fvg_lookback_period + swing-point slack -- 
 INTRADAY_WINDOW_BARS = 400          # matches production's bounded live intraday window, same constant as run_symbol_backtest's daily WINDOW_BARS
 
 
+def _completed_before(bars: Optional[pd.DataFrame], bar_length: timedelta, ts) -> Optional[pd.DataFrame]:
+    """The prefix of `bars` whose candles had fully CLOSED by `ts` -- a
+    1h/4h bar that's still forming at the current 5-minute bar's time is
+    not something the live routine can see either (orchestration/
+    bar_cache.drop_incomplete_last_bar), so the walk-forward must not
+    peek at it. None stays None (trend read reports n/a, fails open)."""
+    if bars is None or bars.empty:
+        return None
+    n = bars.index.searchsorted(ts - bar_length, side="right")
+    return bars.iloc[:n] if n > 0 else None
+
+
+def resample_ohlcv(bars: pd.DataFrame, rule: str, offset: Optional[str] = None) -> pd.DataFrame:
+    """Aggregates finer bars into coarser ones (e.g. 1h -> 4h). yfinance
+    has no native 4h interval, so the backtest builds it from 60m bars;
+    `offset="9h30min"` aligns bins to the US regular-session open so a
+    4h bar means 9:30-13:30 / 13:30-16:00 ET, matching Robinhood's own
+    regular-session 4hour bars (2 per day) that the live routine feeds."""
+    agg = bars.resample(rule, offset=offset, label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    )
+    return agg.dropna(subset=["open"])
+
+
 def run_symbol_backtest_intraday(
     symbol: str,
     intraday_bars: pd.DataFrame,
@@ -294,6 +318,8 @@ def run_symbol_backtest_intraday(
     settings: Settings,
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
     warmup_bars: int = DEFAULT_INTRADAY_WARMUP_BARS,
+    hourly_bars: Optional[pd.DataFrame] = None,
+    four_hour_bars: Optional[pd.DataFrame] = None,
 ) -> SymbolBacktestResult:
     """Same walk-forward simulation as run_symbol_backtest, but at intraday
     (typically 5-minute) bar resolution instead of daily -- the only way to
@@ -312,6 +338,14 @@ def run_symbol_backtest_intraday(
     not-yet-complete daily candle never leaks into either calculation --
     recomputed once per calendar day (not once per intraday bar) since it
     only actually changes then.
+
+    `hourly_bars`/`four_hour_bars` feed the trend_1h/trend_4h HARD vetoes
+    (brain/confluence.py) for both entry gating and trend-invalidation
+    exits, sliced per bar to candles that had fully closed by the current
+    5-minute bar's time (_completed_before) -- same no-peeking rule as the
+    daily slice. Omit either and that veto reports n/a (fails open), which
+    is a materially more permissive strategy than production runs, so
+    run_backtest_intraday always supplies both.
     """
     opt = settings.options
     result = SymbolBacktestResult(symbol=symbol)
@@ -331,6 +365,8 @@ def run_symbol_backtest_intraday(
         if current_date != last_date:
             daily_window = daily_bars[daily_bars.index.date < current_date]
             last_date = current_date
+        hourly_window = _completed_before(hourly_bars, timedelta(hours=1), bar_ts)
+        four_hour_window = _completed_before(four_hour_bars, timedelta(hours=4), bar_ts)
 
         if open_trade is not None:
             days_held = (current_date - open_trade.entry_date).days
@@ -365,8 +401,11 @@ def run_symbol_backtest_intraday(
                 window, direction, sma_period=opt.sma_period, min_confluence_score=opt.min_confluence_score,
                 fvg_lookback_period=opt.fvg_lookback_period, fvg_body_multiplier=opt.fvg_body_multiplier,
                 daily_bars=daily_window if not daily_window.empty else None,
+                hourly_bars=hourly_window, four_hour_bars=four_hour_window,
+                trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
+                trend_veto_hard=opt.trend_veto_hard,
             )
-            if any(confluence.details.get(k) == "fail" for k in HARD_VETO_KEYS):
+            if confluence.hard_vetoed:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "trend_invalidated"
                 open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
                 result.trades.append(open_trade)
@@ -388,6 +427,9 @@ def run_symbol_backtest_intraday(
             opt.sma_period, opt.min_confluence_score,
             daily_bars=daily_window if not daily_window.empty else None,
             min_gap_atr_multiplier=opt.fvg_min_gap_atr_multiplier,
+            hourly_bars=hourly_window, four_hour_bars=four_hour_window,
+            trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
+            trend_veto_hard=opt.trend_veto_hard,
         )
 
         if "no fair value gap" not in decision.reasoning and "didn't confirm it" not in decision.reasoning:
@@ -467,6 +509,7 @@ def run_backtest(symbols: List[str], start: str, end: str, settings: Settings) -
 
 DEFAULT_INTRADAY_DAYS = 58     # yfinance's 5-minute history caps out around ~60 days -- see data/fetchers.py; 58 leaves a little slack
 DEFAULT_DAILY_LOOKBACK_DAYS = 500  # comfortably covers a 200-day SMA with warmup room, matches orchestration/run_live.py's DAILY_LOOKBACK_DAYS order of magnitude
+HOURLY_WARMUP_DAYS = 60            # extra 1h history before the 5-minute window, so the resampled 4h SMA(20) is warm from bar one -- mirrors bar_cache's 4hour backfill_days
 
 
 def run_backtest_intraday(
@@ -487,6 +530,10 @@ def run_backtest_intraday(
     end = date.today()
     intraday_start = end - timedelta(days=intraday_days)
     daily_start = end - timedelta(days=daily_lookback_days)
+    # 1h bars start well before the 5-minute window so the 4h SMA(20)
+    # (~10 trading days of 2 bars/day) is already warm on the first
+    # evaluated bar. yfinance keeps ~730 days of 60m history, so no cap issue.
+    hourly_start = intraday_start - timedelta(days=HOURLY_WARMUP_DAYS)
 
     per_symbol: Dict[str, SymbolBacktestResult] = {}
     all_closed: List[SimulatedTrade] = []
@@ -494,7 +541,11 @@ def run_backtest_intraday(
     for symbol in symbols:
         intraday_bars = fetcher.get_bars(symbol, intraday_start.isoformat(), end.isoformat(), timeframe="5m")
         daily_bars = fetcher.get_bars(symbol, daily_start.isoformat(), end.isoformat(), timeframe="1D")
-        result = run_symbol_backtest_intraday(symbol, intraday_bars, daily_bars, settings)
+        hourly_bars = fetcher.get_bars(symbol, hourly_start.isoformat(), end.isoformat(), timeframe="1h")
+        four_hour_bars = resample_ohlcv(hourly_bars, "4h", offset="9h30min")
+        result = run_symbol_backtest_intraday(
+            symbol, intraday_bars, daily_bars, settings, hourly_bars=hourly_bars, four_hour_bars=four_hour_bars,
+        )
         per_symbol[symbol] = result
         all_closed.extend(t for t in result.trades if t.is_closed)
 

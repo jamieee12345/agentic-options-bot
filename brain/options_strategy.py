@@ -13,9 +13,11 @@ Two-stage decision, in order:
   2. CONFLUENCE GATE -- given a candidate direction, does it clear
      brain/confluence.py's combined check across market structure,
      support/resistance, supply/demand, liquidity sweeps, volume profile,
-     Elliott Wave, and the 200-SMA trend? See that module's docstring for
-     the important honesty note about what "confluence score" does and
-     does NOT mean (a rule-agreement count, not a backtested probability).
+     Elliott Wave, the 1-hour and 4-hour trend, and the daily trend? See
+     that module's docstring for the important honesty note about what
+     "confluence score" does and does NOT mean (a rule-agreement count,
+     not a backtested probability), and for why 1h/4h (not daily) carry
+     the hard-veto trend check now.
 
 "hold" (no fresh trigger, or a trigger that fails confluence) is
 deliberately NOT the same as "close": the absence of a new signal doesn't
@@ -82,12 +84,21 @@ def decide_options_action(
     min_confluence_score: float = DEFAULT_MIN_CONFLUENCE_SCORE,
     daily_bars: Optional[pd.DataFrame] = None,
     min_gap_atr_multiplier: float = DEFAULT_MIN_GAP_ATR_MULTIPLIER,
+    hourly_bars: Optional[pd.DataFrame] = None,
+    four_hour_bars: Optional[pd.DataFrame] = None,
+    trend_1h_period: int = 20,
+    trend_4h_period: int = 20,
+    trend_veto_hard: bool = True,
 ) -> OptionsDecision:
     """`bars` is whatever interval the live strategy is actually watching
     for FVG/momentum (intraday, for live trading -- see
-    orchestration/run_live.py). `daily_bars`, if provided, is used ONLY for
-    the 200-SMA trend veto inside evaluate_confluence -- omit it (as the
-    backtester does) when `bars` already IS daily.
+    orchestration/run_live.py). `daily_bars`, `hourly_bars`, and
+    `four_hour_bars` each feed a SEPARATE trend read inside
+    evaluate_confluence -- see that module's docstring for why there are
+    three now (1h/4h are the hard vetoes, matched to this strategy's own
+    1-2 DTE holding period; daily is a soft check only). Omitting any of
+    them just means that specific trend read reports "n/a" (fails open,
+    never silently blocks) rather than erroring.
     """
     if len(bars) < MIN_BARS_REQUIRED:
         return OptionsDecision(symbol, "hold", 0.0, f"only {len(bars)} bar(s) available, need at least {MIN_BARS_REQUIRED}")
@@ -109,6 +120,9 @@ def decide_options_action(
     confluence = evaluate_confluence(
         bars, direction, sma_period=sma_period, min_confluence_score=min_confluence_score,
         fvg_lookback_period=lookback_period, fvg_body_multiplier=body_multiplier, daily_bars=daily_bars,
+        hourly_bars=hourly_bars, four_hour_bars=four_hour_bars,
+        trend_1h_period=trend_1h_period, trend_4h_period=trend_4h_period,
+        trend_veto_hard=trend_veto_hard,
     )
 
     if not confluence.passed:
