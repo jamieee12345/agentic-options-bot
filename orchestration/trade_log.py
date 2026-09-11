@@ -72,6 +72,11 @@ class TradeLogEntry:
     confluence_score: Optional[float] = None
     confluence_applicable: Optional[int] = None
     confluence_details: Dict[str, str] = field(default_factory=dict)
+    # Sweep model (brain/sweep_strategy.py): invalidation/target prices DEFINED
+    # AT ENTRY and persisted so later cycles enforce them unchanged.
+    invalidation_price: Optional[float] = None
+    target_price: Optional[float] = None
+    tier: Optional[str] = None  # "full" / "half"
 
 
 def append_entry(entry: TradeLogEntry, path: Path = DEFAULT_LOG_PATH) -> None:
@@ -141,6 +146,9 @@ class OpenTrade:
     confluence_score: Optional[float] = None
     confluence_applicable: Optional[int] = None
     confluence_details: Dict[str, str] = field(default_factory=dict)
+    invalidation_price: Optional[float] = None
+    target_price: Optional[float] = None
+    tier: Optional[str] = None  # "full" / "half"
 
 
 def build_trade_history(entries: List[TradeLogEntry]) -> "tuple[List[ClosedTrade], List[OpenTrade]]":
@@ -173,6 +181,7 @@ def build_trade_history(entries: List[TradeLogEntry]) -> "tuple[List[ClosedTrade
             strike_price=e.strike_price, expiration_date=e.expiration_date, dte_at_entry=e.dte_at_entry,
             bid=e.bid, ask=e.ask, spread_pct=e.spread_pct, confluence_score=e.confluence_score,
             confluence_applicable=e.confluence_applicable, confluence_details=e.confluence_details,
+            invalidation_price=e.invalidation_price, target_price=e.target_price, tier=e.tier,
         )
         for e in pending.values()
     ]

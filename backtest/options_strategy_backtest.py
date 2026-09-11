@@ -79,6 +79,8 @@ from backtest.metrics import avg_win_loss, max_consecutive_losses, max_drawdown,
 from backtest.options_pricing import black_scholes_price, realized_volatility
 from brain.confluence import evaluate_confluence
 from brain.options_strategy import OptionsDecision, decide_options_action
+from brain.sweep_strategy import decide_sweep_action
+from orchestration.market_hours import MARKET_TZ
 from config.config_loader import Settings, load_settings
 from data.fetchers import YFinanceHistoricalFetcher
 
@@ -107,6 +109,15 @@ class SimulatedTrade:
     # kept so per-indicator attribution can be done after the fact -- which
     # checks were passing on the trades that won vs lost. Diagnostic only.
     entry_details: Dict[str, str] = field(default_factory=dict)
+    # Sweep model: sizing tier and the entry-time invalidation/target.
+    tier: Optional[str] = None
+    invalidation_price: Optional[float] = None
+    target_price: Optional[float] = None
+
+    @property
+    def size_weight(self) -> float:
+        """Half-size trades count half in pooled P&L (conviction 0.5)."""
+        return 0.5 if self.tier == "half" else 1.0
 
     @property
     def is_closed(self) -> bool:
@@ -485,6 +496,128 @@ def run_symbol_backtest_intraday(
     return result
 
 
+def run_symbol_backtest_sweep(
+    symbol: str,
+    intraday_bars: pd.DataFrame,
+    daily_bars: pd.DataFrame,
+    settings: Settings,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    warmup_bars: int = DEFAULT_INTRADAY_WARMUP_BARS,
+    hourly_bars: Optional[pd.DataFrame] = None,
+    four_hour_bars: Optional[pd.DataFrame] = None,
+    decision_hook: Optional[Callable[[pd.Timestamp, OptionsDecision], None]] = None,
+) -> SymbolBacktestResult:
+    """Walk-forward of the SWEEP model (brain/sweep_strategy.py) at 5-minute
+    resolution, mirroring orchestration/options_execution.py's sweep-mode
+    rules exactly: entries only inside options.entry_session_start/end
+    (ET), at most max_entries_per_day, none after the daily loss limit;
+    exits in order max_hold -> expiration -> sweep_invalidated (close
+    beyond the sweep wick) -> target_reached -> stagnant. Half-size trades
+    carry size_weight 0.5 in pooled P&L.
+
+    Same pricing caveats as the rest of this module (theoretical premiums,
+    no costs). Realized daily P&L for the loss limit is measured on the
+    same theoretical premiums, as a fraction of one unit of equity.
+    """
+    opt = settings.options
+    cfg = opt.sweep_config()
+    result = SymbolBacktestResult(symbol=symbol)
+    open_trade: Optional[SimulatedTrade] = None
+    last_date = None
+    daily_window = daily_bars.iloc[:0]
+    entries_today = 0
+    day_pnl = 0.0  # sum of size-weighted pnl_pct closed today, as a fraction of the per-trade budget
+    equity_units = 1.0 / max(opt.max_premium_pct_per_trade, 1e-9)  # one full-size trade = max_premium_pct_per_trade of equity
+
+    for i in range(warmup_bars, len(intraday_bars)):
+        window = intraday_bars.iloc[max(0, i + 1 - INTRADAY_WINDOW_BARS): i + 1]
+        bar_ts = intraday_bars.index[i]
+        et = bar_ts.tz_convert(MARKET_TZ) if bar_ts.tzinfo is not None else bar_ts.tz_localize("UTC").tz_convert(MARKET_TZ)
+        current_date = et.date()
+        spot = float(intraday_bars["close"].iloc[i])
+        result.bars_evaluated += 1
+        just_closed_this_bar = False
+
+        if current_date != last_date:
+            daily_window = daily_bars[daily_bars.index.date < current_date]
+            last_date = current_date
+            entries_today, day_pnl = 0, 0.0
+
+        def _close_trade(reason: str, premium: Optional[float] = None):
+            nonlocal open_trade, just_closed_this_bar, day_pnl
+            open_trade.exit_date, open_trade.exit_reason = current_date, reason
+            open_trade.exit_premium = premium if premium is not None else _price_position(open_trade, spot, current_date, risk_free_rate)
+            result.trades.append(open_trade)
+            if open_trade.pnl_pct is not None:
+                day_pnl += open_trade.pnl_pct * open_trade.size_weight
+            open_trade, just_closed_this_bar = None, True
+
+        if open_trade is not None and (current_date - open_trade.entry_date).days >= opt.max_hold_days:
+            _close_trade("max_hold")
+        if open_trade is not None and (open_trade.expiration_date - current_date).days <= opt.close_before_expiration_days:
+            _close_trade("expiration")
+        if open_trade is not None and open_trade.invalidation_price is not None:
+            if (open_trade.option_type == "call" and spot < open_trade.invalidation_price) or (open_trade.option_type == "put" and spot > open_trade.invalidation_price):
+                _close_trade("sweep_invalidated")
+        if open_trade is not None and open_trade.target_price is not None:
+            if (open_trade.option_type == "call" and spot >= open_trade.target_price) or (open_trade.option_type == "put" and spot <= open_trade.target_price):
+                _close_trade("target_reached")
+        if open_trade is not None:
+            current_value = _price_position(open_trade, spot, current_date, risk_free_rate)
+            pnl_pct = (current_value / open_trade.entry_premium) - 1 if open_trade.entry_premium > 0 else 0
+            dte_at_entry = (open_trade.expiration_date - open_trade.entry_date).days
+            days_held = (current_date - open_trade.entry_date).days
+            if days_held >= opt.stagnant_exit_hold_fraction * dte_at_entry and pnl_pct < opt.stagnant_exit_min_pnl_pct:
+                _close_trade("stagnant", current_value)
+
+        hhmm = et.strftime("%H:%M")
+        in_session = opt.entry_session_start <= hhmm < opt.entry_session_end
+        loss_limited = opt.daily_loss_limit_pct > 0 and (day_pnl / equity_units) <= -opt.daily_loss_limit_pct
+        if not in_session or open_trade is not None or just_closed_this_bar:
+            continue
+        if opt.max_entries_per_day and entries_today >= opt.max_entries_per_day:
+            continue
+        if loss_limited:
+            continue
+
+        decision = decide_sweep_action(
+            symbol, window, bar_ts.to_pydatetime(), daily_bars=daily_window if not daily_window.empty else None,
+            hourly_bars=_completed_before(hourly_bars, timedelta(hours=1), bar_ts),
+            four_hour_bars=_completed_before(four_hour_bars, timedelta(hours=4), bar_ts), cfg=cfg,
+        )
+        if decision.confluence_details.get("sweep") == "pass":
+            result.fvg_triggers += 1  # "triggers" = sweeps seen, for this model
+            if decision.action == "hold":
+                result.confluence_rejections += 1
+        if decision_hook is not None and decision.confluence_details:
+            decision_hook(bar_ts, decision)
+        if decision.action not in ("buy_call", "buy_put"):
+            continue
+
+        wanted_type = "call" if decision.action == "buy_call" else "put"
+        expiration = current_date + timedelta(days=_target_dte(settings))
+        iv = realized_volatility(daily_window) if len(daily_window) >= 2 else 0.20
+        try:
+            entry_premium = black_scholes_price(spot, spot, (expiration - current_date).days / 365, risk_free_rate, iv, wanted_type)
+        except ValueError as exc:
+            logger.warning("%s @ %s: skipping trade, couldn't price entry (%s)", symbol, current_date, exc)
+            continue
+        if entry_premium <= 0:
+            continue
+        open_trade = SimulatedTrade(
+            symbol=symbol, option_type=wanted_type, entry_date=current_date, entry_spot=spot, strike=spot,
+            expiration_date=expiration, entry_iv=iv, entry_premium=entry_premium,
+            gap_low=decision.gap_low, gap_high=decision.gap_high, entry_details=dict(decision.confluence_details),
+            tier=decision.tier, invalidation_price=decision.invalidation_price, target_price=decision.target_price,
+        )
+        result.trades_opened += 1
+        entries_today += 1
+
+    if open_trade is not None:
+        result.trades.append(open_trade)
+    return result
+
+
 @dataclass
 class BacktestReport:
     per_symbol: Dict[str, SymbolBacktestResult]
@@ -556,7 +689,8 @@ def run_backtest_intraday(
         daily_bars = fetcher.get_bars(symbol, daily_start.isoformat(), end.isoformat(), timeframe="1D")
         hourly_bars = fetcher.get_bars(symbol, hourly_start.isoformat(), end.isoformat(), timeframe="1h")
         four_hour_bars = resample_ohlcv(hourly_bars, "4h", offset="9h30min")
-        result = run_symbol_backtest_intraday(
+        walk = run_symbol_backtest_sweep if settings.options.model == "sweep" else run_symbol_backtest_intraday
+        result = walk(
             symbol, intraday_bars, daily_bars, settings, hourly_bars=hourly_bars, four_hour_bars=four_hour_bars,
         )
         per_symbol[symbol] = result

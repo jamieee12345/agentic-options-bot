@@ -140,6 +140,43 @@ options:
   # window in the first place.
   max_hold_days: 1
 
+  # ---- ENTRY MODEL (2026-09-11) -------------------------------------------
+  # "sweep": ONE model -- liquidity sweep -> displacement gap -> entry
+  # (brain/sweep_strategy.py). Replaces the multi-indicator confluence gate
+  # after per-indicator attribution showed it rejecting ~90% of triggers
+  # for no measurable edge, and after two live dry-run days with zero
+  # entries. "confluence" = the original gate (kept for comparison only).
+  model: sweep
+
+  # Entries only inside this ET window ("Trade your session"). Outside it
+  # every cycle still manages exits. The hourly routine can't watch a
+  # one-hour window on its own, so extra routines fire at ~9:40/9:55/
+  # 10:10/10:25 ET during the session.
+  entry_session_start: "09:30"
+  entry_session_end: "10:30"
+
+  # Account protection for NEW entries (exits are never blocked):
+  # at most this many entries per ET day, and none once the day's realized
+  # + unrealized P&L is at or below -daily_loss_limit_pct x equity.
+  # Sizing is fixed-fraction (max_premium_pct_per_trade x conviction), so a
+  # win never sizes up the next trade and a loss never sizes down.
+  max_entries_per_day: 2
+  daily_loss_limit_pct: 0.05
+
+  # Sweep detection: a sweep anywhere in the last sweep_lookback_bars
+  # 5-minute bars (12 = one hour, so an hourly cycle can't miss it); the
+  # displacement gap must form within displacement_window_bars after the
+  # sweep bar; price may be at most max_chase_atr x ATR past the gap's
+  # far edge ("don't chase"); the opening range is the first
+  # opening_range_minutes of the session; HTF-gap context looks back
+  # htf_gap_lookback_bars on the 1h/4h series. Plain structural defaults,
+  # not searched against a backtest.
+  sweep_lookback_bars: 12
+  displacement_window_bars: 6
+  max_chase_atr: 0.5
+  opening_range_minutes: 15
+  htf_gap_lookback_bars: 30
+
   # Raised from 0.5%/5% (tuned for a much larger account) to 20%/30%, on
   # request: at $1,000 equity, 0.5% is a $5 budget, which never clears
   # safety/options_sizing.py's $50 minimum-premium floor -- the account

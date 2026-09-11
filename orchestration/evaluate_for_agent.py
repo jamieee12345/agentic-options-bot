@@ -132,6 +132,9 @@ def _build_executor(settings) -> OptionsOrderExecutor:
         max_hold_days=opt.max_hold_days,
         trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
         confluence_policy=opt.confluence_policy(),
+        model=opt.model, sweep_config=opt.sweep_config(),
+        entry_session=(opt.entry_session_start, opt.entry_session_end),
+        max_entries_per_day=opt.max_entries_per_day, daily_loss_limit_pct=opt.daily_loss_limit_pct,
         live_trading_enabled=settings.broker.live_trading_enabled,
     )
 
@@ -348,6 +351,7 @@ def cmd_record(args: argparse.Namespace) -> None:
         trade_type=args.option_type, quantity=args.quantity, price=args.price, notional=args.notional,
         dry_run=not args.live, order_id=args.order_id, reason=args.reason,
         gap_low=args.gap_low, gap_high=args.gap_high,
+        invalidation_price=args.invalidation_price, target_price=args.target_price, tier=args.tier,
         strike_price=args.strike_price,
         expiration_date=args.expiration_date,
         dte_at_entry=args.dte_at_entry, bid=args.bid, ask=args.ask, spread_pct=args.spread_pct,
@@ -417,6 +421,9 @@ if __name__ == "__main__":
     p_rec.add_argument("--reason", default=None)
     p_rec.add_argument("--gap-low", type=float, default=None)
     p_rec.add_argument("--gap-high", type=float, default=None)
+    p_rec.add_argument("--invalidation-price", type=float, default=None, help="Sweep model: close beyond this exits")
+    p_rec.add_argument("--target-price", type=float, default=None, help="Sweep model: reaching this exits")
+    p_rec.add_argument("--tier", default=None, help="Sweep model: full / half")
     p_rec.add_argument("--strike-price", type=float, default=None)
     p_rec.add_argument("--expiration-date", default=None)
     p_rec.add_argument("--dte-at-entry", type=int, default=None)

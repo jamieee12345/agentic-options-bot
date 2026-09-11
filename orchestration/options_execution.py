@@ -79,12 +79,14 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from brain.confluence import DEFAULT_POLICY, ConfluencePolicy, evaluate_confluence
 from brain.options_strategy import OptionsDecision, decide_options_action
+from brain.sweep_strategy import SweepConfig, decide_sweep_action
+from orchestration.market_hours import MARKET_TZ
 from data.options_data import OptionContract, RobinhoodOptionChainFetcher
 from orchestration.activity_log import ActivityEntry
 from orchestration.activity_log import DEFAULT_LOG_PATH as DEFAULT_ACTIVITY_LOG_PATH
@@ -214,6 +216,11 @@ class OptionsOrderExecutor:
         trend_1h_period: int = 20,
         trend_4h_period: int = 20,
         confluence_policy: ConfluencePolicy = DEFAULT_POLICY,
+        model: str = "confluence",
+        sweep_config: Optional[SweepConfig] = None,
+        entry_session: Optional[Tuple[str, str]] = None,
+        max_entries_per_day: int = 0,
+        daily_loss_limit_pct: float = 0.0,
         live_trading_enabled: bool = False,
         duplicate_guard: Optional[DuplicateOrderGuard] = None,
         trade_log_path: Path = DEFAULT_LOG_PATH,
@@ -239,6 +246,23 @@ class OptionsOrderExecutor:
         self.trend_1h_period = trend_1h_period
         self.trend_4h_period = trend_4h_period
         self.confluence_policy = confluence_policy  # which checks gate entries/exits -- see brain/confluence.ConfluencePolicy
+        # Which entry model runs: "sweep" (brain/sweep_strategy.py -- ONE
+        # model: liquidity sweep -> displacement gap -> entry, with the
+        # sweep wick as invalidation and the next pool as target) or
+        # "confluence" (the original FVG + multi-check gate). Exits differ
+        # too: sweep mode uses sweep_invalidated / target_reached in place
+        # of fvg_invalidated / trend_invalidated.
+        self.model = model
+        self.sweep_config = sweep_config or SweepConfig()
+        # Entry-only session window in ET ("HH:MM", "HH:MM"); outside it a
+        # cycle only manages exits. None = entries allowed any time.
+        self.entry_session = entry_session
+        # Account protection (both 0 = off): no new entries once this many
+        # have been opened today, or once today's realized + unrealized
+        # P&L is at or below -daily_loss_limit_pct x equity. Exits are
+        # never blocked by either.
+        self.max_entries_per_day = max_entries_per_day
+        self.daily_loss_limit_pct = daily_loss_limit_pct
         # "Close if going nowhere" -- see the class/module docstrings for
         # why. Only ever reached after trend invalidation didn't already
         # fire this bar (see _check_stagnation_exit).
@@ -292,8 +316,9 @@ class OptionsOrderExecutor:
         # Read once per run(), not once per symbol -- one open position per
         # symbol at a time means this covers every symbol's entry context
         # in a single pass over the log.
-        _closed_unused, still_open_trades = build_trade_history(read_entries(self.trade_log_path))
+        closed_trades, still_open_trades = build_trade_history(read_entries(self.trade_log_path))
         open_trade_by_symbol = {t.symbol: t for t in still_open_trades}
+        entries_blocked = self._entries_blocked_reason(now, equity, closed_trades, still_open_trades, open_positions, open_position_quotes)
 
         for symbol, symbol_bars in bars.items():
             existing = open_positions.get(symbol)
@@ -319,20 +344,26 @@ class OptionsOrderExecutor:
                     records.append(self._close(symbol, existing, now, open_order_symbols, "approaching expiration -- forced close", open_position_quotes))
                     continue
 
-                fvg_record = self._check_fvg_invalidation(
-                    symbol, existing, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes,
-                )
-                if fvg_record is not None:
-                    records.append(fvg_record)
-                    continue
+                if self.model == "sweep":
+                    sweep_exit = self._check_sweep_exits(symbol, existing, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes)
+                    if sweep_exit is not None:
+                        records.append(sweep_exit)
+                        continue
+                else:
+                    fvg_record = self._check_fvg_invalidation(
+                        symbol, existing, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes,
+                    )
+                    if fvg_record is not None:
+                        records.append(fvg_record)
+                        continue
 
-                trend_record = self._check_trend_invalidation(
-                    symbol, existing, symbol_bars, (daily_bars or {}).get(symbol), now, open_order_symbols, open_position_quotes,
-                    hourly_bars_for_symbol=(hourly_bars or {}).get(symbol), four_hour_bars_for_symbol=(four_hour_bars or {}).get(symbol),
-                )
-                if trend_record is not None:
-                    records.append(trend_record)
-                    continue
+                    trend_record = self._check_trend_invalidation(
+                        symbol, existing, symbol_bars, (daily_bars or {}).get(symbol), now, open_order_symbols, open_position_quotes,
+                        hourly_bars_for_symbol=(hourly_bars or {}).get(symbol), four_hour_bars_for_symbol=(four_hour_bars or {}).get(symbol),
+                    )
+                    if trend_record is not None:
+                        records.append(trend_record)
+                        continue
 
                 stagnation_record = self._check_stagnation_exit(
                     symbol, existing, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes,
@@ -341,14 +372,26 @@ class OptionsOrderExecutor:
                     records.append(stagnation_record)
                     continue
 
-            decision = decide_options_action(
-                symbol, symbol_bars, self.fvg_lookback_period, self.fvg_body_multiplier, self.fvg_volume_multiplier,
-                self.sma_period, self.min_confluence_score,
-                daily_bars=(daily_bars or {}).get(symbol), min_gap_atr_multiplier=self.fvg_min_gap_atr_multiplier,
-                hourly_bars=(hourly_bars or {}).get(symbol), four_hour_bars=(four_hour_bars or {}).get(symbol),
-                trend_1h_period=self.trend_1h_period, trend_4h_period=self.trend_4h_period,
-                policy=self.confluence_policy,
-            )
+            if self.model == "sweep":
+                if not self._in_entry_session(now):
+                    decision = OptionsDecision(symbol, "hold", 0.0, f"outside the entry session ({self.entry_session[0]}-{self.entry_session[1]} ET) -- managing exits only")
+                elif entries_blocked is not None:
+                    decision = OptionsDecision(symbol, "hold", 0.0, f"no new entries: {entries_blocked}")
+                else:
+                    decision = decide_sweep_action(
+                        symbol, symbol_bars, now, daily_bars=(daily_bars or {}).get(symbol),
+                        hourly_bars=(hourly_bars or {}).get(symbol), four_hour_bars=(four_hour_bars or {}).get(symbol),
+                        cfg=self.sweep_config,
+                    )
+            else:
+                decision = decide_options_action(
+                    symbol, symbol_bars, self.fvg_lookback_period, self.fvg_body_multiplier, self.fvg_volume_multiplier,
+                    self.sma_period, self.min_confluence_score,
+                    daily_bars=(daily_bars or {}).get(symbol), min_gap_atr_multiplier=self.fvg_min_gap_atr_multiplier,
+                    hourly_bars=(hourly_bars or {}).get(symbol), four_hour_bars=(four_hour_bars or {}).get(symbol),
+                    trend_1h_period=self.trend_1h_period, trend_4h_period=self.trend_4h_period,
+                    policy=self.confluence_policy,
+                )
             # Every branch below that stems from `decision` (not from an
             # executor-level position-management check above) carries the
             # full read-out forward -- gap/volume/confluence detail, not
@@ -403,6 +446,7 @@ class OptionsOrderExecutor:
                     pending_action={
                         "type": "open", "wanted_type": wanted_type, "conviction": decision.conviction,
                         "gap_low": decision.gap_low, "gap_high": decision.gap_high, "reasoning": decision.reasoning,
+                        "invalidation_price": decision.invalidation_price, "target_price": decision.target_price, "tier": decision.tier,
                     },
                     **decision_fields,
                 ))
@@ -425,6 +469,65 @@ class OptionsOrderExecutor:
             ), path=self.activity_log_path)
 
         return records
+
+    # ------------------------------------------------------------------ sweep model helpers
+    def _in_entry_session(self, now: datetime) -> bool:
+        if self.entry_session is None:
+            return True
+        t = now.astimezone(MARKET_TZ).strftime("%H:%M")
+        return self.entry_session[0] <= t < self.entry_session[1]
+
+    def _entries_blocked_reason(self, now, equity, closed_trades, still_open_trades, open_positions, open_position_quotes) -> Optional[str]:
+        """Account protection for NEW entries only (exits are never
+        blocked): entries-per-day cap and daily loss limit, both measured
+        from this bot's own trade log in ET calendar days."""
+        today = now.astimezone(MARKET_TZ).date()
+
+        def _d(ts):
+            try:
+                return datetime.fromisoformat(ts).astimezone(MARKET_TZ).date()
+            except (TypeError, ValueError):
+                return None
+
+        if self.max_entries_per_day > 0:
+            opened_today = sum(1 for t in still_open_trades if _d(t.opened_at) == today) + sum(1 for t in closed_trades if _d(t.opened_at) == today)
+            if opened_today >= self.max_entries_per_day:
+                return f"{opened_today} entries already today (cap {self.max_entries_per_day}) -- done for the day"
+        if self.daily_loss_limit_pct > 0 and equity > 0:
+            realized = sum(t.pnl_dollars for t in closed_trades if _d(t.closed_at) == today)
+            unrealized = 0.0
+            for symbol, pos in open_positions.items():
+                q = (open_position_quotes or {}).get(symbol)
+                if q is not None and q.mid_price is not None and pos.average_premium_paid > 0:
+                    unrealized += (q.mid_price - pos.average_premium_paid) * pos.quantity * 100
+            day_pnl = realized + unrealized
+            if day_pnl <= -self.daily_loss_limit_pct * equity:
+                return f"daily loss limit hit (today {day_pnl:+.0f} vs limit -{self.daily_loss_limit_pct:.0%} of {equity:.0f}) -- no new entries until tomorrow"
+        return None
+
+    def _check_sweep_exits(
+        self, symbol, existing: OpenOptionPosition, current_price: float, open_trade, now, open_order_symbols,
+        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
+    ) -> Optional[OptionsExecutionRecord]:
+        """Sweep model exits, both defined AT ENTRY and read back from the
+        trade log so they never move: (1) invalidation -- price closed
+        beyond the sweep wick; (2) target -- price reached the next
+        opposing liquidity pool. Falls open (no exit) if the open entry
+        predates these fields."""
+        if open_trade is None:
+            return None
+        inv, tgt = open_trade.invalidation_price, open_trade.target_price
+        if inv is not None:
+            if existing.option_type == "call" and current_price < inv:
+                return self._close(symbol, existing, now, open_order_symbols, f"sweep_invalidated: price {current_price:.2f} closed below the sweep wick {inv:.2f} -- the sweep failed", open_position_quotes)
+            if existing.option_type == "put" and current_price > inv:
+                return self._close(symbol, existing, now, open_order_symbols, f"sweep_invalidated: price {current_price:.2f} closed above the sweep wick {inv:.2f} -- the sweep failed", open_position_quotes)
+        if tgt is not None:
+            if existing.option_type == "call" and current_price >= tgt:
+                return self._close(symbol, existing, now, open_order_symbols, f"target_reached: price {current_price:.2f} reached the opposing pool at {tgt:.2f}", open_position_quotes)
+            if existing.option_type == "put" and current_price <= tgt:
+                return self._close(symbol, existing, now, open_order_symbols, f"target_reached: price {current_price:.2f} reached the opposing pool at {tgt:.2f}", open_position_quotes)
+        return None
 
     def _check_fvg_invalidation(
         self, symbol, existing: OpenOptionPosition, current_price: float, open_trade, now, open_order_symbols,
@@ -687,6 +790,7 @@ class OptionsOrderExecutor:
             trade_type=wanted_type, quantity=sizing.contracts, price=contract_price,
             notional=sizing.premium, dry_run=not self.live_trading_enabled, order_id=order_id,
             gap_low=decision.gap_low, gap_high=decision.gap_high,
+            invalidation_price=decision.invalidation_price, target_price=decision.target_price, tier=decision.tier,
             strike_price=contract.strike_price, expiration_date=contract.expiration_date.isoformat(),
             dte_at_entry=contract.days_to_expiration, bid=contract.bid, ask=contract.ask, spread_pct=spread_pct,
             confluence_score=decision.confluence_score, confluence_applicable=decision.confluence_applicable,

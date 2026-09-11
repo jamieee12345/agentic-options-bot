@@ -156,6 +156,9 @@ def build_executor(broker: RobinhoodBroker, chain_fetcher: RobinhoodOptionChainF
         max_hold_days=opt.max_hold_days,
         trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
         confluence_policy=opt.confluence_policy(),
+        model=opt.model, sweep_config=opt.sweep_config(),
+        entry_session=(opt.entry_session_start, opt.entry_session_end),
+        max_entries_per_day=opt.max_entries_per_day, daily_loss_limit_pct=opt.daily_loss_limit_pct,
         # NOTE: this flag lives under settings.yaml's broker: section, not
         # options: -- it's a single shared kill switch for both pipelines,
         # not a separate one per asset class.

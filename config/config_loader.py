@@ -174,6 +174,20 @@ class OptionsConfig:
     market_structure_must_agree: bool
     min_applicable_checks: int
     min_confluence_score: float
+    # Entry model: "sweep" (brain/sweep_strategy.py, the one-model
+    # liquidity-sweep design) or "confluence" (the original gate above).
+    model: str
+    # Sweep model: entry session in ET, account protection, detection
+    # parameters -- see settings.yaml for what each means.
+    entry_session_start: str
+    entry_session_end: str
+    max_entries_per_day: int
+    daily_loss_limit_pct: float
+    sweep_lookback_bars: int
+    displacement_window_bars: int
+    max_chase_atr: float
+    opening_range_minutes: int
+    htf_gap_lookback_bars: int
     # No longer live exit triggers -- see orchestration/options_execution.py's
     # _check_trend_invalidation, which replaced both with a single
     # trend-based exit (re-checks the same hard-veto checks that gated
@@ -260,6 +274,23 @@ class OptionsConfig:
             raise ConfigError(f"a check can't be both hard and soft: {sorted(overlap)}")
         if not self.confluence_soft_checks:
             raise ConfigError("options.confluence_soft_checks must name at least one check")
+        if self.model not in ("sweep", "confluence"):
+            raise ConfigError(f"options.model ({self.model!r}) must be 'sweep' or 'confluence'")
+        for label in ("entry_session_start", "entry_session_end"):
+            v = getattr(self, label)
+            if not (isinstance(v, str) and len(v) == 5 and v[2] == ":" and v[:2].isdigit() and v[3:].isdigit()):
+                raise ConfigError(f"options.{label} ({v!r}) must be 'HH:MM' (ET)")
+        if self.entry_session_start >= self.entry_session_end:
+            raise ConfigError("options.entry_session_start must be before entry_session_end")
+        if self.max_entries_per_day < 0:
+            raise ConfigError("options.max_entries_per_day must be >= 0 (0 = unlimited)")
+        if not (0 <= self.daily_loss_limit_pct < 1):
+            raise ConfigError("options.daily_loss_limit_pct must be in [0, 1) (0 = off)")
+        for label in ("sweep_lookback_bars", "displacement_window_bars", "opening_range_minutes", "htf_gap_lookback_bars"):
+            if getattr(self, label) <= 0:
+                raise ConfigError(f"options.{label} must be positive")
+        if self.max_chase_atr < 0:
+            raise ConfigError("options.max_chase_atr must be >= 0")
         if self.min_applicable_checks < 1:
             raise ConfigError(f"options.min_applicable_checks ({self.min_applicable_checks}) must be >= 1")
         if self.min_applicable_checks > len(self.confluence_soft_checks) + (0 if self.trend_veto_hard else 2):
@@ -278,6 +309,17 @@ class OptionsConfig:
         if self.max_hold_days <= 0:
             raise ConfigError(f"options.max_hold_days ({self.max_hold_days}) must be positive")
 
+
+    def sweep_config(self):
+        """The brain/sweep_strategy.SweepConfig this config describes."""
+        from brain.sweep_strategy import SweepConfig
+        return SweepConfig(
+            sweep_lookback_bars=self.sweep_lookback_bars, displacement_window_bars=self.displacement_window_bars,
+            max_chase_atr=self.max_chase_atr, opening_range_minutes=self.opening_range_minutes,
+            htf_gap_lookback_bars=self.htf_gap_lookback_bars,
+            fvg_lookback_period=self.fvg_lookback_period, fvg_body_multiplier=self.fvg_body_multiplier,
+            fvg_volume_multiplier=self.fvg_volume_multiplier, fvg_min_gap_atr_multiplier=self.fvg_min_gap_atr_multiplier,
+        )
 
     def confluence_policy(self):
         """The brain/confluence.ConfluencePolicy this config describes."""

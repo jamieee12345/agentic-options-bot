@@ -72,6 +72,12 @@ class OptionsDecision:
     confluence_details: Dict[str, str] = field(default_factory=dict)
     confluence_score: Optional[float] = None
     confluence_applicable: int = 0
+    # Sweep model only (brain/sweep_strategy.py): invalidation and target
+    # defined at signal time, and the sizing tier ("full"/"half"). None
+    # for the confluence model.
+    invalidation_price: Optional[float] = None
+    target_price: Optional[float] = None
+    tier: Optional[str] = None
 
 
 def decide_options_action(

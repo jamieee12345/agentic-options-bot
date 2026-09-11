@@ -122,6 +122,8 @@ def render_markdown(j: dict) -> str:
             L.append(f"- Premium: {_money(t.price)} per contract (bid {_money(t.bid)} / ask {_money(t.ask)}), notional {_money(t.notional)}")
             if t.gap_low is not None:
                 L.append(f"- Triggering gap: {t.gap_low:.2f} – {t.gap_high:.2f}")
+            if t.invalidation_price is not None or t.target_price is not None or t.tier:
+                L.append(f"- Plan: {(t.tier or '').upper()} size · invalidation {t.invalidation_price if t.invalidation_price is None else f'{t.invalidation_price:.2f}'} · target {t.target_price if t.target_price is None else f'{t.target_price:.2f}'}")
             if t.confluence_score is not None:
                 L.append(f"- Confluence: {t.confluence_score:.0%} over {t.confluence_applicable} applicable — {t.confluence_details}")
             if t.reason:
@@ -205,6 +207,8 @@ def render_html(j: dict, md: str) -> str:
             ]
             if t.gap_low is not None:
                 rows.append(("Gap", f"{t.gap_low:.2f} – {t.gap_high:.2f}"))
+            if t.invalidation_price is not None or t.target_price is not None or t.tier:
+                rows.append(("Plan", f"{(t.tier or '').upper()} size · invalidation {'—' if t.invalidation_price is None else f'{t.invalidation_price:.2f}'} · target {'—' if t.target_price is None else f'{t.target_price:.2f}'}"))
             if t.confluence_score is not None:
                 checks = " ".join(f"<span class='chk {v}'>{esc(k)}</span>" for k, v in t.confluence_details.items())
                 rows.append(("Confluence", f"{t.confluence_score:.0%} over {t.confluence_applicable} applicable<br>{checks}"))
