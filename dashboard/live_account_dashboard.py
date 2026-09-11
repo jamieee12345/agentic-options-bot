@@ -80,7 +80,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Iterable, Dict, List, Optional
 
 from data.news import AlpacaNewsFetcher, NewsItem
 from orchestration.account_snapshot import DEFAULT_EQUITY_HISTORY_PATH, DEFAULT_SNAPSHOT_PATH
@@ -186,16 +186,24 @@ def _classify_activity(entries: List[ActivityEntry]) -> tuple[List[ActivityEntry
     return significant, summaries
 
 
-def _latest_per_symbol(entries: List[ActivityEntry]) -> List[ActivityEntry]:
+def _latest_per_symbol(entries: List[ActivityEntry], watchlist: Optional[Iterable[str]] = None) -> List[ActivityEntry]:
     """One entry per symbol -- whichever has the latest timestamp -- sorted
     by symbol so the panel's card order doesn't jump around between
     refreshes. Deliberately NOT date-filtered to "today" (unlike
     _classify_activity's input): right at market open, or before the bot's
     first cycle of the day, this should still show yesterday's last read
     rather than an empty panel.
+
+    `watchlist`, when given, restricts the panel to symbols the bot is
+    CURRENTLY watching (settings.yaml's broker.core_watchlist). Without it,
+    a symbol dropped from the watchlist would keep showing its last-ever
+    read indefinitely, since the activity log is append-only history.
     """
+    allowed = {sym.upper() for sym in watchlist} if watchlist is not None else None
     latest: Dict[str, ActivityEntry] = {}
     for e in entries:
+        if allowed is not None and e.symbol.upper() not in allowed:
+            continue
         current = latest.get(e.symbol)
         if current is None or e.timestamp > current.timestamp:
             latest[e.symbol] = e
@@ -210,6 +218,7 @@ def fetch_snapshot(
     activity_log_path: Path = DEFAULT_ACTIVITY_LOG_PATH,
     equity_history_path: Path = DEFAULT_EQUITY_HISTORY_PATH,
     snapshot_path: Path = DEFAULT_SNAPSHOT_PATH,
+    watchlist: Optional[Iterable[str]] = None,
 ) -> DashboardSnapshot:
     """Pure read of files the MCP routine already committed and pushed --
     see orchestration/account_snapshot.py's module docstring for why this
@@ -256,7 +265,7 @@ def fetch_snapshot(
         today_local = now.astimezone(MARKET_TZ).date()
         today_entries = entries_for_date(all_activity_entries, today_local)
         significant_events, symbol_summaries = _classify_activity(today_entries)
-        live_reasoning = _latest_per_symbol(all_activity_entries)
+        live_reasoning = _latest_per_symbol(all_activity_entries, watchlist)
     except Exception:
         logger.exception("Failed to read activity log at %s this cycle", activity_log_path)
         significant_events, symbol_summaries, live_reasoning = [], [], []
@@ -1068,7 +1077,10 @@ def run_forever(
         if auto_pull:
             _git_pull()
         try:
-            snapshot = fetch_snapshot(settings.options.stop_loss_pct, settings.options.take_profit_pct, news_fetcher)
+            snapshot = fetch_snapshot(
+                settings.options.stop_loss_pct, settings.options.take_profit_pct, news_fetcher,
+                watchlist=settings.broker.core_watchlist,
+            )
             last_good = snapshot
         except Exception as exc:
             logger.exception("Dashboard refresh failed this cycle -- will retry next cycle")
