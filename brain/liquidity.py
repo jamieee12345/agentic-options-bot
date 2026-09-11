@@ -120,15 +120,20 @@ def find_session_pools(
     pools: List[LiquidityPool] = []
     today = now.astimezone(MARKET_TZ).date()
 
+    def _et_date(ts):
+        # yfinance daily bars are tz-naive (calendar dates); Robinhood/MCP
+        # bars are UTC-aware. Treat naive as already-a-calendar-date.
+        return ts.date() if ts.tzinfo is None else ts.astimezone(MARKET_TZ).date()
+
     if daily_bars is not None and not daily_bars.empty:
-        mask = [ts.astimezone(MARKET_TZ).date() < today for ts in daily_bars.index]
+        mask = [_et_date(ts) < today for ts in daily_bars.index]
         prior = daily_bars[mask]
         if not prior.empty:
             pd_bar = prior.iloc[-1]
             pools.append(LiquidityPool("buy_side", float(pd_bar["high"]), 1, "major", "previous_day_high"))
             pools.append(LiquidityPool("sell_side", float(pd_bar["low"]), 1, "major", "previous_day_low"))
 
-    todays = bars[[ts.astimezone(MARKET_TZ).date() == today for ts in bars.index]]
+    todays = bars[[_et_date(ts) == today for ts in bars.index]]
     if not todays.empty:
         first_ts = todays.index[0]
         opening = todays[todays.index < first_ts + pd.Timedelta(minutes=opening_range_minutes)]
