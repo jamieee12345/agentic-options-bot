@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 from orchestration.account_snapshot import DEFAULT_SNAPSHOT_PATH, read_account_snapshot
 from orchestration.activity_log import DEFAULT_LOG_PATH as ACTIVITY_PATH
-from orchestration.activity_log import ActivityEntry, entries_for_date, read_entries as read_activity
+from orchestration.activity_log import ActivityEntry, read_entries as read_activity
 from orchestration.trade_log import DEFAULT_LOG_PATH as TRADE_PATH
 from orchestration.trade_log import TradeLogEntry, build_trade_history, read_entries as read_trades
 
@@ -74,7 +74,9 @@ def _load_equity_for_date(path: Path, target: date) -> List[tuple]:
 
 def build_journal(target: date, activity_path: Path = ACTIVITY_PATH, trade_path: Path = TRADE_PATH,
                   equity_path: Path = Path("equity_history.jsonl"), snapshot_path: Path = DEFAULT_SNAPSHOT_PATH) -> dict:
-    activity = entries_for_date(read_activity(activity_path), target)
+    # Filter on the ET calendar date (the market date), not UTC: an evening
+    # ET cycle is already the next UTC day, and vice versa for late-night runs.
+    activity = [e for e in read_activity(activity_path) if datetime.fromisoformat(e.timestamp).astimezone(ET).date() == target]
     trades_all = read_trades(trade_path)
     trades = [t for t in trades_all if datetime.fromisoformat(t.timestamp).astimezone(ET).date() == target]
     closed, still_open = build_trade_history(trades_all)
