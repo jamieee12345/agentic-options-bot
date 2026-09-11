@@ -38,6 +38,14 @@ a verdict from tested Python instead of its own judgment:
                duplicate-order guard. The agent never computes any of this
                itself, only relays the verdict.
 
+  note         Journals an OPEN signal the agent could NOT execute -- no
+               expiration inside the DTE window, an empty instrument list,
+               or size_check saying no -- as an activity-log entry
+               (outcome "skipped_execution"). Without this, the day's
+               journal would show a "wanted to open" signal and then
+               silence; with it, every intended trade has a recorded
+               outcome, executed or not.
+
   record       Appends the REAL outcome (did the agent actually place the
                order? what order_id?) to trade_log.jsonl/activity_log.jsonl,
                using the exact same TradeLogEntry/ActivityEntry shapes the
@@ -123,7 +131,7 @@ def _build_executor(settings) -> OptionsOrderExecutor:
         stagnant_exit_min_pnl_pct=opt.stagnant_exit_min_pnl_pct,
         max_hold_days=opt.max_hold_days,
         trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
-        trend_veto_hard=opt.trend_veto_hard,
+        confluence_policy=opt.confluence_policy(),
         live_trading_enabled=settings.broker.live_trading_enabled,
     )
 
@@ -320,6 +328,17 @@ def cmd_size_check(args: argparse.Namespace) -> None:
     print(json.dumps(result))
 
 
+def cmd_note(args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc)
+    append_activity_entry(ActivityEntry(
+        timestamp=now.isoformat(), symbol=args.symbol, outcome="skipped_execution",
+        option_type=args.option_type, contracts=None,
+        detail=f"[DRY RUN] wanted to open {args.option_type} but could not execute -- {args.reason}",
+        price=args.price,
+    ), path=Path(args.activity_log_path))
+    print(json.dumps({"noted": True, "symbol": args.symbol, "reason": args.reason}))
+
+
 def cmd_record(args: argparse.Namespace) -> None:
     now = datetime.now(timezone.utc)
     confluence_details = json.loads(args.confluence_details) if args.confluence_details else {}
@@ -377,6 +396,14 @@ if __name__ == "__main__":
     p_size.add_argument("--open-order-symbols", default=None, help="JSON array")
     p_size.add_argument("--settings", default="config/settings.yaml")
     p_size.set_defaults(func=cmd_size_check)
+
+    p_note = sub.add_parser("note", help="Journal an open signal that could not be executed (no valid expiration, empty chain, sizing rejected)")
+    p_note.add_argument("--symbol", required=True)
+    p_note.add_argument("--option-type", required=True)
+    p_note.add_argument("--reason", required=True)
+    p_note.add_argument("--price", type=float, default=None, help="Underlying price at the time, if known")
+    p_note.add_argument("--activity-log-path", default=str(DEFAULT_ACTIVITY_LOG_PATH))
+    p_note.set_defaults(func=cmd_note)
 
     p_rec = sub.add_parser("record", help="Persist the real outcome of an executed (or dry-run) order")
     p_rec.add_argument("--event", choices=["open", "close"], required=True)

@@ -83,7 +83,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from brain.confluence import evaluate_confluence
+from brain.confluence import DEFAULT_POLICY, ConfluencePolicy, evaluate_confluence
 from brain.options_strategy import OptionsDecision, decide_options_action
 from data.options_data import OptionContract, RobinhoodOptionChainFetcher
 from orchestration.activity_log import ActivityEntry
@@ -213,7 +213,7 @@ class OptionsOrderExecutor:
         max_hold_days: int,
         trend_1h_period: int = 20,
         trend_4h_period: int = 20,
-        trend_veto_hard: bool = True,
+        confluence_policy: ConfluencePolicy = DEFAULT_POLICY,
         live_trading_enabled: bool = False,
         duplicate_guard: Optional[DuplicateOrderGuard] = None,
         trade_log_path: Path = DEFAULT_LOG_PATH,
@@ -238,7 +238,7 @@ class OptionsOrderExecutor:
         # -- both entry gating and _check_trend_invalidation use these.
         self.trend_1h_period = trend_1h_period
         self.trend_4h_period = trend_4h_period
-        self.trend_veto_hard = trend_veto_hard  # see brain/confluence.evaluate_confluence
+        self.confluence_policy = confluence_policy  # which checks gate entries/exits -- see brain/confluence.ConfluencePolicy
         # "Close if going nowhere" -- see the class/module docstrings for
         # why. Only ever reached after trend invalidation didn't already
         # fire this bar (see _check_stagnation_exit).
@@ -347,7 +347,7 @@ class OptionsOrderExecutor:
                 daily_bars=(daily_bars or {}).get(symbol), min_gap_atr_multiplier=self.fvg_min_gap_atr_multiplier,
                 hourly_bars=(hourly_bars or {}).get(symbol), four_hour_bars=(four_hour_bars or {}).get(symbol),
                 trend_1h_period=self.trend_1h_period, trend_4h_period=self.trend_4h_period,
-                trend_veto_hard=self.trend_veto_hard,
+                policy=self.confluence_policy,
             )
             # Every branch below that stems from `decision` (not from an
             # executor-level position-management check above) carries the
@@ -506,7 +506,7 @@ class OptionsOrderExecutor:
             daily_bars=daily_bars_for_symbol,
             hourly_bars=hourly_bars_for_symbol, four_hour_bars=four_hour_bars_for_symbol,
             trend_1h_period=self.trend_1h_period, trend_4h_period=self.trend_4h_period,
-            trend_veto_hard=self.trend_veto_hard,
+            policy=self.confluence_policy,
         )
         if result.hard_vetoed:
             return self._close(

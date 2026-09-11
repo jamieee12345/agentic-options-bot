@@ -52,7 +52,7 @@ Two tiers, deliberately different from each other:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional
+from typing import Tuple, Dict, List, Literal, Optional
 
 import pandas as pd
 
@@ -103,6 +103,50 @@ SOFT_CHECK_KEYS = (
     "break_of_structure", "support_resistance", "supply_demand", "liquidity_sweep", "volume_profile",
     "rsi_momentum", "volatility_expansion", "vpvr_node_quality", "trend_200sma",
 )
+ALL_CHECK_KEYS = HARD_VETO_KEYS + SOFT_CHECK_KEYS
+
+
+@dataclass(frozen=True)
+class ConfluencePolicy:
+    """WHICH checks gate an entry, and HOW. Every check in ALL_CHECK_KEYS is
+    still computed and recorded in ConfluenceResult.details on every call
+    (the dashboard shows all of them); this only decides which ones have
+    a say in the pass/fail.
+
+    hard_checks:  any of these reading "fail" vetoes the trade outright.
+    soft_checks:  these feed the score (passes / applicable) that must
+                  clear min_confluence_score.
+    structure_must_agree: if True, market_structure reading "n/a"
+                  (ranging -- no clear trend structure) ALSO vetoes, not
+                  just an opposing structure. Added 2026-09-10 after
+                  per-indicator attribution on the 58-day intraday backtest
+                  showed trades taken in a ranging structure averaging
+                  -23% vs +18% with an agreeing one -- by far the largest
+                  single split of any check.
+    trend_veto_hard: False moves trend_1h/trend_4h out of hard_checks and
+                  into soft_checks (see settings.yaml's options.trend_veto_hard).
+
+    The defaults reproduce the pre-policy behaviour exactly (all four hard
+    vetoes, all nine soft checks, ranging allowed, three applicable
+    required). config/settings.yaml's options.confluence_* keys build the
+    policy the bot actually runs -- OptionsConfig.confluence_policy().
+    """
+    hard_checks: Tuple[str, ...] = HARD_VETO_KEYS
+    soft_checks: Tuple[str, ...] = SOFT_CHECK_KEYS
+    structure_must_agree: bool = False
+    min_applicable_checks: int = DEFAULT_MIN_APPLICABLE_CHECKS
+    trend_veto_hard: bool = True
+
+    def effective_keys(self) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+        """(hard, soft) after applying trend_veto_hard."""
+        hard, soft = tuple(self.hard_checks), tuple(self.soft_checks)
+        if not self.trend_veto_hard:
+            hard = tuple(k for k in hard if k not in ("trend_1h", "trend_4h"))
+            soft = soft + tuple(k for k in ("trend_1h", "trend_4h") if k not in soft)
+        return hard, soft
+
+
+DEFAULT_POLICY = ConfluencePolicy()
 
 
 @dataclass(frozen=True)
@@ -118,7 +162,7 @@ class ConfluenceResult:
     # orchestration/options_execution.py and the backtests) must use this,
     # never `veto_reason`, which is set for the soft-score shortfall too --
     # and never re-derive it from `details`, since which keys count as
-    # hard depends on `trend_veto_hard`.
+    # hard depends on the ConfluencePolicy in force.
     hard_vetoed: bool = False
 
 
@@ -127,7 +171,6 @@ def evaluate_confluence(
     direction: Literal["bullish", "bearish"],
     sma_period: int = 200,
     min_confluence_score: float = DEFAULT_MIN_CONFLUENCE_SCORE,
-    min_applicable_checks: int = DEFAULT_MIN_APPLICABLE_CHECKS,
     fvg_lookback_period: int = 10,
     fvg_body_multiplier: float = 1.5,
     daily_bars: Optional[pd.DataFrame] = None,
@@ -137,7 +180,7 @@ def evaluate_confluence(
     four_hour_bars: Optional[pd.DataFrame] = None,
     trend_1h_period: int = 20,
     trend_4h_period: int = 20,
-    trend_veto_hard: bool = True,
+    policy: ConfluencePolicy = DEFAULT_POLICY,
 ) -> ConfluenceResult:
     """`bars` drives every check except the trend reads -- for live,
     intraday-interval trading, `bars` is expected to be intraday (so
@@ -162,15 +205,16 @@ def evaluate_confluence(
     evidenced than one without), it just no longer blocks a trade outright
     on its own.
 
-    `trend_veto_hard` selects the ROLE of trend_1h/trend_4h: True (the
-    default) makes each an outright veto as described above; False keeps
-    both computed and recorded but folds them into the soft score next to
-    trend_200sma instead. Added after a 25-day SPY/QQQ A/B suggested the
-    hard form was removing the large reversal winners; the full-watchlist
-    58-day A/B then showed it a wash (PF 0.970 hard vs 0.966 soft, on 66
-    vs 237 trades), so hard stays the default and the toggle remains for
-    honest re-testing. config/settings.yaml's options.trend_veto_hard is
-    the single source for it.
+    `policy` (ConfluencePolicy) decides which of the computed checks are
+    hard vetoes, which feed the soft score, whether a ranging market
+    structure counts as a veto, and how many applicable soft checks are
+    required. Its trend_veto_hard flag selects the ROLE of trend_1h/
+    trend_4h: True makes each an outright veto as described above; False
+    folds them into the soft score next to trend_200sma instead (tested
+    on the full watchlist, 58 days: a wash -- PF 0.970 hard vs 0.966
+    soft, on 66 vs 237 trades -- so hard stays the default).
+    config/settings.yaml's options.confluence_* keys are the single
+    source for the policy the bot runs.
     """
     price = float(bars["close"].iloc[-1])
     swings = find_swing_points(bars)
@@ -214,18 +258,9 @@ def evaluate_confluence(
     # stays "n/a" rather than "pass".
     details["elliott_wave"] = "fail" if (impulse.valid_impulse and impulse.impulse_direction == direction) else "n/a"
 
-    veto_reason: Optional[str] = None
-    if trend_veto_hard and details["trend_1h"] == "fail":
-        veto_reason = f"1-hour trend is {trend_1h.direction}, opposing a {direction} trade"
-    elif trend_veto_hard and details["trend_4h"] == "fail":
-        veto_reason = f"4-hour trend is {trend_4h.direction}, opposing a {direction} trade"
-    elif details["market_structure"] == "fail":
-        veto_reason = f"market structure is a clear {structure}, opposing a {direction} trade"
-    elif details["elliott_wave"] == "fail":
-        veto_reason = (
-            f"a {direction} Elliott-Wave-rule-valid impulse just completed -- "
-            "entering now would be chasing exhaustion, not the move"
-        )
+    # The veto DECISION is made below, once every check (hard and soft)
+    # has been computed -- see "--- decision ---" -- so a policy may name
+    # any check as hard.
 
     # Daily 200-SMA: still computed, no longer a veto -- see module
     # docstring above for why. Folds into the SOFT_CHECK_KEYS score below
@@ -299,11 +334,38 @@ def evaluate_confluence(
     details["rsi_momentum"] = rsi_momentum_check(bars, direction, rsi_period)
     details["volatility_expansion"] = volatility_expansion_check(bars, atr_period)
 
-    soft_keys = SOFT_CHECK_KEYS if trend_veto_hard else SOFT_CHECK_KEYS + ("trend_1h", "trend_4h")
-    passes = sum(1 for k in soft_keys if details[k] == "pass")
-    fails = sum(1 for k in soft_keys if details[k] == "fail")
+    # --- decision ---------------------------------------------------------
+    hard_keys, soft_keys = policy.effective_keys()
+
+    def _veto_message(key: str) -> str:
+        if key == "trend_1h":
+            return f"1-hour trend is {trend_1h.direction}, opposing a {direction} trade"
+        if key == "trend_4h":
+            return f"4-hour trend is {trend_4h.direction}, opposing a {direction} trade"
+        if key == "market_structure":
+            return f"market structure is a clear {structure}, opposing a {direction} trade"
+        if key == "elliott_wave":
+            return (
+                f"a {direction} Elliott-Wave-rule-valid impulse just completed -- "
+                "entering now would be chasing exhaustion, not the move"
+            )
+        return f"{key} check failed, opposing a {direction} trade"
+
+    veto_reason: Optional[str] = None
+    for key in hard_keys:
+        reading = details.get(key, "n/a")
+        if reading == "fail":
+            veto_reason = _veto_message(key)
+            break
+        if key == "market_structure" and policy.structure_must_agree and reading == "n/a":
+            veto_reason = f"market structure is ranging -- no clear {agreeing_structure} to trade with"
+            break
+
+    passes = sum(1 for k in soft_keys if details.get(k) == "pass")
+    fails = sum(1 for k in soft_keys if details.get(k) == "fail")
     applicable = passes + fails
     score = (passes / applicable) if applicable > 0 else None
+    min_applicable_checks = policy.min_applicable_checks
 
     # A hard veto blocks the trade regardless of how the soft checks scored
     # -- but `score`/`applicable` above are still the REAL computed soft

@@ -217,13 +217,34 @@ options:
   # not from this choice. Not a knob to search over.
   trend_veto_hard: true
 
+  # WHICH checks gate an entry (brain/confluence.py's ConfluencePolicy).
+  # Every check is still computed and shown on the dashboard; these lists
+  # decide which ones have a say. Chosen 2026-09-10 from per-indicator
+  # attribution on the 58-day intraday backtest (749 FVG+volume triggers,
+  # 68 trades taken), on request to cut the indicator count down to what
+  # demonstrably carries information:
+  #   market_structure  pass avg +18.4% vs ranging (n/a) avg -23.4% -- the
+  #                     largest split of any check, hence must_agree below
+  #   volume_profile    pass +7.9% vs fail -29.8% (n=56/12)
+  #   trend_200sma      pass +9.9% vs fail -9.8%  (n=38/30)
+  #   support_resistance pass +1.4% vs fail -58.9% (n=21/5, thin)
+  # Dropped as noise or inverted on that sample: supply_demand,
+  # vpvr_node_quality, liquidity_sweep (n/a 93% of the time),
+  # elliott_wave (n/a 96%), rsi_momentum, volatility_expansion,
+  # break_of_structure (4 fails -- unreadable). One validation run follows
+  # this change; it is NOT to be iterated on against the backtest.
+  confluence_hard_checks: [trend_1h, trend_4h, market_structure]
+  market_structure_must_agree: true
+  confluence_soft_checks: [volume_profile, trend_200sma, support_resistance]
+  # With three soft checks, require at least two to be applicable (S/R
+  # reads n/a when no level is nearby) before a score means anything.
+  min_applicable_checks: 2
+
   # Confluence gate (brain/confluence.py): require this fraction of
-  # applicable SOFT checks (break-of-structure, S/R, supply/demand,
-  # liquidity sweep, volume profile, RSI momentum, ATR volatility
-  # expansion) to agree with the candidate direction before trading.
-  # market-structure/200-SMA/Elliott-Wave are separate HARD VETOES --
-  # always enforced regardless of this number, see HARD_VETO_KEYS in
-  # confluence.py. This is "N% of independent rule-based checks agree,"
+  # applicable SOFT checks (confluence_soft_checks above) to agree with
+  # the candidate direction before trading. confluence_hard_checks above
+  # are separate HARD VETOES -- always enforced regardless of this number.
+  # This is "N% of independent rule-based checks agree,"
   # not a backtested probability of profit -- see confluence.py's module
   # docstring for why those are genuinely different claims.
   #

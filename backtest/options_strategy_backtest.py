@@ -71,14 +71,14 @@ import argparse
 import logging
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Dict, List, Literal, Optional
+from typing import Callable, Dict, List, Literal, Optional
 
 import pandas as pd
 
 from backtest.metrics import avg_win_loss, max_consecutive_losses, max_drawdown, profit_factor, win_rate
 from backtest.options_pricing import black_scholes_price, realized_volatility
 from brain.confluence import evaluate_confluence
-from brain.options_strategy import decide_options_action
+from brain.options_strategy import OptionsDecision, decide_options_action
 from config.config_loader import Settings, load_settings
 from data.fetchers import YFinanceHistoricalFetcher
 
@@ -103,6 +103,10 @@ class SimulatedTrade:
     exit_date: Optional[date] = None
     exit_reason: Optional[str] = None
     exit_premium: Optional[float] = None
+    # The confluence read-out at entry (check name -> "pass"/"fail"/"n/a"),
+    # kept so per-indicator attribution can be done after the fact -- which
+    # checks were passing on the trades that won vs lost. Diagnostic only.
+    entry_details: Dict[str, str] = field(default_factory=dict)
 
     @property
     def is_closed(self) -> bool:
@@ -213,6 +217,7 @@ def run_symbol_backtest(
             confluence = evaluate_confluence(
                 window, direction, sma_period=opt.sma_period, min_confluence_score=opt.min_confluence_score,
                 fvg_lookback_period=opt.fvg_lookback_period, fvg_body_multiplier=opt.fvg_body_multiplier,
+                policy=opt.confluence_policy(),
             )
             if confluence.hard_vetoed:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "trend_invalidated"
@@ -239,6 +244,7 @@ def run_symbol_backtest(
         decision = decide_options_action(
             symbol, window, opt.fvg_lookback_period, opt.fvg_body_multiplier, opt.fvg_volume_multiplier,
             opt.sma_period, opt.min_confluence_score, min_gap_atr_multiplier=opt.fvg_min_gap_atr_multiplier,
+            policy=opt.confluence_policy(),
         )
 
         if "no fair value gap" not in decision.reasoning and "didn't confirm it" not in decision.reasoning:
@@ -274,6 +280,7 @@ def run_symbol_backtest(
                 symbol=symbol, option_type=wanted_type, entry_date=current_date, entry_spot=spot,
                 strike=spot, expiration_date=expiration, entry_iv=iv, entry_premium=entry_premium,
                 gap_low=decision.gap_low, gap_high=decision.gap_high,
+                entry_details=dict(decision.confluence_details),
             )
             result.trades_opened += 1
 
@@ -320,6 +327,7 @@ def run_symbol_backtest_intraday(
     warmup_bars: int = DEFAULT_INTRADAY_WARMUP_BARS,
     hourly_bars: Optional[pd.DataFrame] = None,
     four_hour_bars: Optional[pd.DataFrame] = None,
+    decision_hook: Optional[Callable[[pd.Timestamp, OptionsDecision], None]] = None,
 ) -> SymbolBacktestResult:
     """Same walk-forward simulation as run_symbol_backtest, but at intraday
     (typically 5-minute) bar resolution instead of daily -- the only way to
@@ -403,7 +411,7 @@ def run_symbol_backtest_intraday(
                 daily_bars=daily_window if not daily_window.empty else None,
                 hourly_bars=hourly_window, four_hour_bars=four_hour_window,
                 trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
-                trend_veto_hard=opt.trend_veto_hard,
+                policy=opt.confluence_policy(),
             )
             if confluence.hard_vetoed:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "trend_invalidated"
@@ -429,7 +437,7 @@ def run_symbol_backtest_intraday(
             min_gap_atr_multiplier=opt.fvg_min_gap_atr_multiplier,
             hourly_bars=hourly_window, four_hour_bars=four_hour_window,
             trend_1h_period=opt.trend_1h_period, trend_4h_period=opt.trend_4h_period,
-            trend_veto_hard=opt.trend_veto_hard,
+            policy=opt.confluence_policy(),
         )
 
         if "no fair value gap" not in decision.reasoning and "didn't confirm it" not in decision.reasoning:
@@ -438,6 +446,10 @@ def run_symbol_backtest_intraday(
             elif "confluence check failed" in decision.reasoning:
                 result.fvg_triggers += 1
                 result.confluence_rejections += 1
+            # Diagnostic tap: every decision that carried a confluence
+            # read (i.e. the FVG+volume trigger fired), taken or rejected.
+            if decision_hook is not None and decision.confluence_details:
+                decision_hook(bar_ts, decision)
 
         if open_trade is not None and decision.action in ("buy_call", "buy_put"):
             wanted_type = "call" if decision.action == "buy_call" else "put"
@@ -463,6 +475,7 @@ def run_symbol_backtest_intraday(
                 symbol=symbol, option_type=wanted_type, entry_date=current_date, entry_spot=spot,
                 strike=spot, expiration_date=expiration, entry_iv=iv, entry_premium=entry_premium,
                 gap_low=decision.gap_low, gap_high=decision.gap_high,
+                entry_details=dict(decision.confluence_details),
             )
             result.trades_opened += 1
 

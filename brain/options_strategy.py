@@ -32,7 +32,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from brain.confluence import DEFAULT_MIN_CONFLUENCE_SCORE, evaluate_confluence
+from brain.confluence import DEFAULT_MIN_CONFLUENCE_SCORE, DEFAULT_POLICY, ConfluencePolicy, evaluate_confluence
 from brain.fvg_indicators import (
     DEFAULT_BODY_MULTIPLIER,
     DEFAULT_LOOKBACK_PERIOD,
@@ -88,7 +88,7 @@ def decide_options_action(
     four_hour_bars: Optional[pd.DataFrame] = None,
     trend_1h_period: int = 20,
     trend_4h_period: int = 20,
-    trend_veto_hard: bool = True,
+    policy: ConfluencePolicy = DEFAULT_POLICY,
 ) -> OptionsDecision:
     """`bars` is whatever interval the live strategy is actually watching
     for FVG/momentum (intraday, for live trading -- see
@@ -122,7 +122,7 @@ def decide_options_action(
         fvg_lookback_period=lookback_period, fvg_body_multiplier=body_multiplier, daily_bars=daily_bars,
         hourly_bars=hourly_bars, four_hour_bars=four_hour_bars,
         trend_1h_period=trend_1h_period, trend_4h_period=trend_4h_period,
-        trend_veto_hard=trend_veto_hard,
+        policy=policy,
     )
 
     if not confluence.passed:

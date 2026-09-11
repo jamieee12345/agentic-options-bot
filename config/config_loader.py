@@ -167,6 +167,12 @@ class OptionsConfig:
     trend_1h_period: int
     trend_4h_period: int
     trend_veto_hard: bool
+    # Which confluence checks gate an entry, and how -- see
+    # brain/confluence.ConfluencePolicy (built by confluence_policy() below).
+    confluence_hard_checks: List[str]
+    confluence_soft_checks: List[str]
+    market_structure_must_agree: bool
+    min_applicable_checks: int
     min_confluence_score: float
     # No longer live exit triggers -- see orchestration/options_execution.py's
     # _check_trend_invalidation, which replaced both with a single
@@ -242,6 +248,22 @@ class OptionsConfig:
             raise ConfigError(f"options.trend_4h_period ({self.trend_4h_period}) must be positive")
         if not (0 < self.min_confluence_score <= 1.0):
             raise ConfigError(f"options.min_confluence_score ({self.min_confluence_score}) must be in (0, 1]")
+        from brain.confluence import ALL_CHECK_KEYS  # local import: brain/ must not become a hard dependency of loading config
+        for label, keys in (("confluence_hard_checks", self.confluence_hard_checks), ("confluence_soft_checks", self.confluence_soft_checks)):
+            unknown = [k for k in keys if k not in ALL_CHECK_KEYS]
+            if unknown:
+                raise ConfigError(f"options.{label} has unknown check(s) {unknown}; valid: {list(ALL_CHECK_KEYS)}")
+            if len(set(keys)) != len(keys):
+                raise ConfigError(f"options.{label} has duplicates: {keys}")
+        overlap = set(self.confluence_hard_checks) & set(self.confluence_soft_checks)
+        if overlap:
+            raise ConfigError(f"a check can't be both hard and soft: {sorted(overlap)}")
+        if not self.confluence_soft_checks:
+            raise ConfigError("options.confluence_soft_checks must name at least one check")
+        if self.min_applicable_checks < 1:
+            raise ConfigError(f"options.min_applicable_checks ({self.min_applicable_checks}) must be >= 1")
+        if self.min_applicable_checks > len(self.confluence_soft_checks) + (0 if self.trend_veto_hard else 2):
+            raise ConfigError(f"options.min_applicable_checks ({self.min_applicable_checks}) exceeds the number of soft checks ({len(self.confluence_soft_checks)})")
         if not (0 < self.stop_loss_pct <= 1.0):
             raise ConfigError(f"options.stop_loss_pct ({self.stop_loss_pct}) must be in (0, 1]")
         if self.take_profit_pct <= 0:
@@ -256,6 +278,15 @@ class OptionsConfig:
         if self.max_hold_days <= 0:
             raise ConfigError(f"options.max_hold_days ({self.max_hold_days}) must be positive")
 
+
+    def confluence_policy(self):
+        """The brain/confluence.ConfluencePolicy this config describes."""
+        from brain.confluence import ConfluencePolicy
+        return ConfluencePolicy(
+            hard_checks=tuple(self.confluence_hard_checks), soft_checks=tuple(self.confluence_soft_checks),
+            structure_must_agree=self.market_structure_must_agree,
+            min_applicable_checks=self.min_applicable_checks, trend_veto_hard=self.trend_veto_hard,
+        )
 
 @dataclass(frozen=True)
 class BacktestingConfig:
