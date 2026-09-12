@@ -147,6 +147,10 @@ class OptionsConfig:
     # the MIN_ALLOWED_DTE floor applies. Set true only for a deliberate,
     # named test -- it removes a safety rule. See settings.yaml.
     allow_0dte: bool
+    # Whether the FVG-invalidation STOP (close back through the whole entry
+    # gap) is an exit at all. False = trend invalidation + max hold +
+    # expiration are the only structural exits. Testable via backtest.
+    fvg_invalidation_exit: bool
     # On the expiration boundary day (days-to-expiry == close_before_
     # expiration_days) a position is force-closed at the first cycle AT or
     # AFTER this ET time, not at the first cycle of the day -- so a 0DTE

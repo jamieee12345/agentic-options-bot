@@ -435,7 +435,7 @@ def run_symbol_backtest_intraday(
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
 
-        if open_trade is not None and open_trade.gap_low is not None and open_trade.gap_high is not None:
+        if opt.fvg_invalidation_exit and open_trade is not None and open_trade.gap_low is not None and open_trade.gap_high is not None:
             invalidated = (
                 (open_trade.option_type == "call" and spot < open_trade.gap_low) or
                 (open_trade.option_type == "put" and spot > open_trade.gap_high)

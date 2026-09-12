@@ -227,6 +227,7 @@ class OptionsOrderExecutor:
         max_open_positions: int = 0,
         weekly_loss_limit_pct: float = 0.0,
         expiration_day_close_time: str = "15:00",
+        fvg_invalidation_exit: bool = True,
         live_trading_enabled: bool = False,
         duplicate_guard: Optional[DuplicateOrderGuard] = None,
         trade_log_path: Path = DEFAULT_LOG_PATH,
@@ -282,6 +283,9 @@ class OptionsOrderExecutor:
         # after this ET time (not at the day's first cycle) -- lets a 0DTE
         # position trade its session while still closing before expiry.
         self.expiration_day_close_time = expiration_day_close_time
+        # False disables exit #3 (the FVG-invalidation stop); trend
+        # invalidation then carries both the profit-taking and loss-cutting.
+        self.fvg_invalidation_exit = fvg_invalidation_exit
         # "Close if going nowhere" -- see the class/module docstrings for
         # why. Only ever reached after trend invalidation didn't already
         # fire this bar (see _check_stagnation_exit).
@@ -379,7 +383,7 @@ class OptionsOrderExecutor:
                 else:
                     fvg_record = self._check_fvg_invalidation(
                         symbol, existing, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes,
-                    )
+                    ) if self.fvg_invalidation_exit else None
                     if fvg_record is not None:
                         records.append(fvg_record)
                         continue

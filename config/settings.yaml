@@ -131,6 +131,15 @@ options:
   # expiry. (For 1-2 DTE this never binds: max_hold closes next morning.)
   expiration_day_close_time: "15:00"
 
+  # Exit #3, the FVG-invalidation stop (price closes back through the whole
+  # entry gap). User's decision 2026-09-12: the FVG stays the ENTRY trigger
+  # but is no longer an exit -- on the 58-day window this stop was 0% win /
+  # ~-25% avg by construction. With it off, trend invalidation (any hard
+  # veto flipping) plus max hold / expiration are the structural exits, so
+  # a loser runs until the 1h/4h trend or market structure actually breaks.
+  # Re-validated on the same window: see the commit that flipped this.
+  fvg_invalidation_exit: false
+
   # Force-close any open options position once it's ON its expiration day
   # (0 = same-day, not "1 day before" as it was under the old 2-7 DTE
   # window). This is now the LAST-RESORT backstop, not the primary time
