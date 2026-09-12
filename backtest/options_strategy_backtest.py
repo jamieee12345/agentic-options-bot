@@ -70,7 +70,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Callable, Dict, List, Literal, Optional
 
 import pandas as pd
@@ -154,6 +154,26 @@ def _target_dte(settings: Settings) -> int:
 def _price_position(trade: SimulatedTrade, spot: float, current_date: date, risk_free_rate: float) -> float:
     years_to_expiry = max((trade.expiration_date - current_date).days, 0) / 365
     return black_scholes_price(spot, trade.strike, years_to_expiry, risk_free_rate, trade.entry_iv, trade.option_type)
+
+
+MARKET_CLOSE_ET = (16, 0)
+
+
+def _years_to_expiry(expiration_date: date, bar_ts) -> float:
+    """Hour-level time to expiry for the INTRADAY walks: expiry is 4:00pm ET
+    on the expiration date, measured from the bar's own timestamp. The
+    daily walk keeps whole-day granularity (it has no intraday clock).
+    Without this, a same-day round trip on a 1-DTE contract was priced as
+    "1 day left" at both entry and exit -- i.e. zero intraday theta --
+    and 0DTE could not be priced at all (T = 0 -> intrinsic only)."""
+    ts = bar_ts if getattr(bar_ts, "tzinfo", None) is not None else pd.Timestamp(bar_ts).tz_localize("UTC")
+    expiry = pd.Timestamp(datetime.combine(expiration_date, time(*MARKET_CLOSE_ET)), tz=MARKET_TZ)
+    seconds = (expiry - ts).total_seconds()
+    return max(seconds, 0.0) / (365.0 * 86400.0)
+
+
+def _price_position_at(trade: SimulatedTrade, spot: float, bar_ts, risk_free_rate: float) -> float:
+    return black_scholes_price(spot, trade.strike, _years_to_expiry(trade.expiration_date, bar_ts), risk_free_rate, trade.entry_iv, trade.option_type)
 
 
 def run_symbol_backtest(
@@ -398,7 +418,7 @@ def run_symbol_backtest_intraday(
             days_held = (current_date - open_trade.entry_date).days
             if days_held >= opt.max_hold_days:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "max_hold"
-                open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                open_trade.exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
 
@@ -406,7 +426,7 @@ def run_symbol_backtest_intraday(
             days_left = (open_trade.expiration_date - current_date).days
             if days_left <= opt.close_before_expiration_days:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "expiration"
-                open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                open_trade.exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
 
@@ -417,7 +437,7 @@ def run_symbol_backtest_intraday(
             )
             if invalidated:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "fvg_invalidated"
-                open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                open_trade.exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
 
@@ -433,12 +453,12 @@ def run_symbol_backtest_intraday(
             )
             if confluence.hard_vetoed:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "trend_invalidated"
-                open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                open_trade.exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
 
         if open_trade is not None:
-            current_value = _price_position(open_trade, spot, current_date, risk_free_rate)
+            current_value = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
             pnl_pct = (current_value / open_trade.entry_premium) - 1 if open_trade.entry_premium > 0 else 0
             dte_at_entry = (open_trade.expiration_date - open_trade.entry_date).days
             days_held = (current_date - open_trade.entry_date).days
@@ -478,7 +498,7 @@ def run_symbol_backtest_intraday(
             wanted_type = "call" if decision.action == "buy_call" else "put"
             if wanted_type != open_trade.option_type:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "flip"
-                open_trade.exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                open_trade.exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
 
@@ -487,7 +507,7 @@ def run_symbol_backtest_intraday(
             expiration = current_date + timedelta(days=_target_dte(settings))
             iv = realized_volatility(daily_window) if len(daily_window) >= 2 else 0.20
             try:
-                entry_premium = black_scholes_price(spot, spot, (expiration - current_date).days / 365, risk_free_rate, iv, wanted_type)
+                entry_premium = black_scholes_price(spot, spot, _years_to_expiry(expiration, bar_ts), risk_free_rate, iv, wanted_type)
             except ValueError as exc:
                 logger.warning("%s @ %s: skipping trade, couldn't price entry (%s)", symbol, current_date, exc)
                 continue
@@ -558,7 +578,7 @@ def run_symbol_backtest_sweep(
         def _close_trade(reason: str, premium: Optional[float] = None):
             nonlocal open_trade, just_closed_this_bar, day_pnl
             open_trade.exit_date, open_trade.exit_reason = current_date, reason
-            open_trade.exit_premium = premium if premium is not None else _price_position(open_trade, spot, current_date, risk_free_rate)
+            open_trade.exit_premium = premium if premium is not None else _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
             result.trades.append(open_trade)
             if open_trade.pnl_pct is not None:
                 day_pnl += open_trade.pnl_pct * open_trade.size_weight
@@ -575,7 +595,7 @@ def run_symbol_backtest_sweep(
             if (open_trade.option_type == "call" and spot >= open_trade.target_price) or (open_trade.option_type == "put" and spot <= open_trade.target_price):
                 _close_trade("target_reached")
         if open_trade is not None:
-            current_value = _price_position(open_trade, spot, current_date, risk_free_rate)
+            current_value = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
             pnl_pct = (current_value / open_trade.entry_premium) - 1 if open_trade.entry_premium > 0 else 0
             dte_at_entry = (open_trade.expiration_date - open_trade.entry_date).days
             days_held = (current_date - open_trade.entry_date).days
@@ -610,7 +630,7 @@ def run_symbol_backtest_sweep(
         expiration = current_date + timedelta(days=_target_dte(settings))
         iv = realized_volatility(daily_window) if len(daily_window) >= 2 else 0.20
         try:
-            entry_premium = black_scholes_price(spot, spot, (expiration - current_date).days / 365, risk_free_rate, iv, wanted_type)
+            entry_premium = black_scholes_price(spot, spot, _years_to_expiry(expiration, bar_ts), risk_free_rate, iv, wanted_type)
         except ValueError as exc:
             logger.warning("%s @ %s: skipping trade, couldn't price entry (%s)", symbol, current_date, exc)
             continue
@@ -676,7 +696,7 @@ def run_symbol_backtest_orb(
         def _close_trade(reason: str, premium: Optional[float] = None):
             nonlocal open_trade, just_closed_this_bar, day_pnl, partial_taken
             open_trade.exit_date, open_trade.exit_reason = current_date, reason
-            open_trade.exit_premium = premium if premium is not None else _price_position(open_trade, spot, current_date, risk_free_rate)
+            open_trade.exit_premium = premium if premium is not None else _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
             result.trades.append(open_trade)
             if open_trade.pnl_pct is not None:
                 day_pnl += open_trade.pnl_pct * open_trade.size_weight
@@ -693,7 +713,7 @@ def run_symbol_backtest_orb(
             elif open_trade.invalidation_price is not None and ((is_call and spot < open_trade.invalidation_price) or (not is_call and spot > open_trade.invalidation_price)):
                 _close_trade("stop_hit")
             elif open_trade.target_price is not None and not partial_taken and ((is_call and spot >= open_trade.target_price) or (not is_call and spot <= open_trade.target_price)):
-                open_trade.partial_exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                open_trade.partial_exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 partial_taken = True
             elif partial_taken:
                 todays = todays_bars(window, bar_ts.to_pydatetime())
@@ -726,7 +746,7 @@ def run_symbol_backtest_orb(
         expiration = current_date + timedelta(days=_target_dte(settings))
         iv = realized_volatility(daily_window) if len(daily_window) >= 2 else 0.20
         try:
-            entry_premium = black_scholes_price(spot, spot, (expiration - current_date).days / 365, risk_free_rate, iv, wanted_type)
+            entry_premium = black_scholes_price(spot, spot, _years_to_expiry(expiration, bar_ts), risk_free_rate, iv, wanted_type)
         except ValueError:
             continue
         if entry_premium <= 0:
