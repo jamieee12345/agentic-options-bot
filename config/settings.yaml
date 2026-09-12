@@ -188,6 +188,38 @@ options:
   opening_range_minutes: 15
   htf_gap_lookback_bars: 30
 
+  # ---- ORB model (options.model: orb) -- brain/orb_strategy.py -----------
+  # User's spec, translated to US hours: 15-minute opening range
+  # (9:30-9:45 ET); enter on the first 5-minute close beyond it with volume
+  # > orb_volume_multiplier x the prior orb_volume_lookback bars and the
+  # close on the right side of session VWAP; stop = opposite range edge or
+  # 1 x ATR(orb_atr_period) whichever is tighter; take a partial at
+  # orb_target_r x R and trail the rest at VWAP / a 2-bar low-high; flat
+  # by time_stop. When switching model to "orb": set entry_session_start
+  # to "09:45" (range must be complete), target_dte_max to 7 (flat by
+  # 3pm, so the nearest weekly is fine and single stocks become tradable
+  # every day), and the routine prompt picks 1 strike ITM (delta ~0.6).
+  # Not yet validated -- must beat the confluence model's 2.436 on the same
+  # window before it goes live.
+  orb_minutes: 15
+  orb_volume_multiplier: 1.5
+  orb_volume_lookback: 20
+  orb_atr_period: 14
+  orb_target_r: 1.5
+  orb_breakout_lookback_bars: 12
+  # Hard time-stop (ET) for the ORB model: every open position is closed
+  # at the first cycle at/after this time. (The spec's 14:30 IST is an hour
+  # before that market's close; 15:00 ET is the same idea here.)
+  time_stop: "15:00"
+
+  # Protection gates that apply to EVERY model, alongside
+  # max_entries_per_day / daily_loss_limit_pct above: never more than
+  # this many positions open at once (0 = unlimited), and a weekly loss
+  # limit -- breach it and no new entries for the rest of that week AND
+  # the following week ("take the next week off").
+  max_open_positions: 3
+  weekly_loss_limit_pct: 0.06
+
   # Raised from 0.5%/5% (tuned for a much larger account) to 20%/30%, on
   # request: at $1,000 equity, 0.5% is a $5 budget, which never clears
   # safety/options_sizing.py's $50 minimum-premium floor -- the account

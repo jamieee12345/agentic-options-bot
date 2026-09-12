@@ -135,6 +135,8 @@ def _build_executor(settings) -> OptionsOrderExecutor:
         model=opt.model, sweep_config=opt.sweep_config(),
         entry_session=(opt.entry_session_start, opt.entry_session_end),
         max_entries_per_day=opt.max_entries_per_day, daily_loss_limit_pct=opt.daily_loss_limit_pct,
+        orb_config=opt.orb_config(), time_stop=opt.time_stop,
+        max_open_positions=opt.max_open_positions, weekly_loss_limit_pct=opt.weekly_loss_limit_pct,
         live_trading_enabled=settings.broker.live_trading_enabled,
     )
 

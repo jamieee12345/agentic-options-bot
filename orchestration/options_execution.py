@@ -77,7 +77,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -86,6 +86,7 @@ import pandas as pd
 from brain.confluence import DEFAULT_POLICY, ConfluencePolicy, evaluate_confluence
 from brain.options_strategy import OptionsDecision, decide_options_action
 from brain.sweep_strategy import SweepConfig, decide_sweep_action
+from brain.orb_strategy import OrbConfig, decide_orb_action, session_vwap, todays_bars
 from orchestration.market_hours import MARKET_TZ
 from data.options_data import OptionContract, RobinhoodOptionChainFetcher
 from orchestration.activity_log import ActivityEntry
@@ -221,6 +222,10 @@ class OptionsOrderExecutor:
         entry_session: Optional[Tuple[str, str]] = None,
         max_entries_per_day: int = 0,
         daily_loss_limit_pct: float = 0.0,
+        orb_config: Optional[OrbConfig] = None,
+        time_stop: Optional[str] = None,
+        max_open_positions: int = 0,
+        weekly_loss_limit_pct: float = 0.0,
         live_trading_enabled: bool = False,
         duplicate_guard: Optional[DuplicateOrderGuard] = None,
         trade_log_path: Path = DEFAULT_LOG_PATH,
@@ -263,6 +268,15 @@ class OptionsOrderExecutor:
         # never blocked by either.
         self.max_entries_per_day = max_entries_per_day
         self.daily_loss_limit_pct = daily_loss_limit_pct
+        # ORB model (brain/orb_strategy.py) + its exit rules: hard time-stop
+        # ("HH:MM" ET, every open position closed at/after it), and two more
+        # account-protection gates that apply to every model: a cap on
+        # simultaneously open positions and a weekly loss limit (a breach
+        # blocks new entries for the rest of THAT week AND the following one).
+        self.orb_config = orb_config or OrbConfig()
+        self.time_stop = time_stop
+        self.max_open_positions = max_open_positions
+        self.weekly_loss_limit_pct = weekly_loss_limit_pct
         # "Close if going nowhere" -- see the class/module docstrings for
         # why. Only ever reached after trend invalidation didn't already
         # fire this bar (see _check_stagnation_exit).
@@ -349,6 +363,11 @@ class OptionsOrderExecutor:
                     if sweep_exit is not None:
                         records.append(sweep_exit)
                         continue
+                elif self.model == "orb":
+                    orb_exit = self._check_orb_exits(symbol, existing, symbol_bars, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes)
+                    if orb_exit is not None:
+                        records.append(orb_exit)
+                        continue
                 else:
                     fvg_record = self._check_fvg_invalidation(
                         symbol, existing, current_price, open_trade_by_symbol.get(symbol), now, open_order_symbols, open_position_quotes,
@@ -383,6 +402,13 @@ class OptionsOrderExecutor:
                         hourly_bars=(hourly_bars or {}).get(symbol), four_hour_bars=(four_hour_bars or {}).get(symbol),
                         cfg=self.sweep_config,
                     )
+            elif self.model == "orb":
+                if not self._in_entry_session(now):
+                    decision = OptionsDecision(symbol, "hold", 0.0, f"outside the entry session ({self.entry_session[0]}-{self.entry_session[1]} ET) -- managing exits only")
+                elif entries_blocked is not None:
+                    decision = OptionsDecision(symbol, "hold", 0.0, f"no new entries: {entries_blocked}")
+                else:
+                    decision = decide_orb_action(symbol, symbol_bars, now, cfg=self.orb_config)
             elif entries_blocked is not None:
                 decision = OptionsDecision(symbol, "hold", 0.0, f"no new entries: {entries_blocked}")
             else:
@@ -491,10 +517,25 @@ class OptionsOrderExecutor:
             except (TypeError, ValueError):
                 return None
 
+        if self.max_open_positions > 0 and len(open_positions) >= self.max_open_positions:
+            return f"{len(open_positions)} positions already open (cap {self.max_open_positions})"
         if self.max_entries_per_day > 0:
             opened_today = sum(1 for t in still_open_trades if _d(t.opened_at) == today) + sum(1 for t in closed_trades if _d(t.opened_at) == today)
             if opened_today >= self.max_entries_per_day:
                 return f"{opened_today} entries already today (cap {self.max_entries_per_day}) -- done for the day"
+        if self.weekly_loss_limit_pct > 0 and equity > 0:
+            iso_week = today.isocalendar()[:2]
+            prev_week = (today - timedelta(days=7)).isocalendar()[:2]
+            def _wk(ts):
+                d = _d(ts)
+                return d.isocalendar()[:2] if d else None
+            this_week = sum(t.pnl_dollars for t in closed_trades if _wk(t.closed_at) == iso_week)
+            last_week = sum(t.pnl_dollars for t in closed_trades if _wk(t.closed_at) == prev_week)
+            limit = -self.weekly_loss_limit_pct * equity
+            if last_week <= limit:
+                return f"last week closed {last_week:+.0f} (limit {limit:.0f}) -- taking this week off"
+            if this_week <= limit:
+                return f"this week is at {this_week:+.0f} (limit {limit:.0f}) -- no new entries until next week"
         if self.daily_loss_limit_pct > 0 and equity > 0:
             realized = sum(t.pnl_dollars for t in closed_trades if _d(t.closed_at) == today)
             unrealized = 0.0
@@ -505,6 +546,39 @@ class OptionsOrderExecutor:
             day_pnl = realized + unrealized
             if day_pnl <= -self.daily_loss_limit_pct * equity:
                 return f"daily loss limit hit (today {day_pnl:+.0f} vs limit -{self.daily_loss_limit_pct:.0%} of {equity:.0f}) -- no new entries until tomorrow"
+        return None
+
+    def _check_orb_exits(
+        self, symbol, existing: OpenOptionPosition, symbol_bars: pd.DataFrame, current_price: float, open_trade, now, open_order_symbols,
+        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
+    ) -> Optional[OptionsExecutionRecord]:
+        """ORB exits, in order: hard time-stop -> stop (close beyond the
+        entry-time invalidation) -> target_r partial (half the contracts if
+        there are at least two, otherwise the whole position) -> after the
+        partial, trail the remainder: exit on a 5-minute close across VWAP
+        against the position or through the prior 2-bar low/high."""
+        if self.time_stop is not None and now.astimezone(MARKET_TZ).strftime("%H:%M") >= self.time_stop:
+            return self._close(symbol, existing, now, open_order_symbols, f"time_stop: {self.time_stop} ET reached -- flat by rule", open_position_quotes)
+        if open_trade is None:
+            return None
+        inv, tgt = open_trade.invalidation_price, open_trade.target_price
+        is_call = existing.option_type == "call"
+        if inv is not None and ((is_call and current_price < inv) or (not is_call and current_price > inv)):
+            return self._close(symbol, existing, now, open_order_symbols, f"stop_hit: price {current_price:.2f} closed beyond the stop {inv:.2f}", open_position_quotes)
+        if tgt is not None and not open_trade.partial_taken and ((is_call and current_price >= tgt) or (not is_call and current_price <= tgt)):
+            if existing.quantity >= 2:
+                return self._close(symbol, existing, now, open_order_symbols, f"target_partial: price {current_price:.2f} reached {tgt:.2f} -- taking half, trailing the rest", open_position_quotes, quantity=existing.quantity // 2)
+            return self._close(symbol, existing, now, open_order_symbols, f"target_reached: price {current_price:.2f} reached {tgt:.2f} (single contract, no partial possible)", open_position_quotes)
+        if open_trade.partial_taken:
+            todays = todays_bars(symbol_bars, now)
+            if len(todays) >= 3:
+                vwap_now = float(session_vwap(todays).iloc[-1])
+                prior2 = todays.iloc[-3:-1]
+                two_bar_low, two_bar_high = float(prior2["low"].min()), float(prior2["high"].max())
+                if is_call and (current_price < vwap_now or current_price < two_bar_low):
+                    return self._close(symbol, existing, now, open_order_symbols, f"trail_exit: close {current_price:.2f} below VWAP {vwap_now:.2f} or the 2-bar low {two_bar_low:.2f}", open_position_quotes)
+                if not is_call and (current_price > vwap_now or current_price > two_bar_high):
+                    return self._close(symbol, existing, now, open_order_symbols, f"trail_exit: close {current_price:.2f} above VWAP {vwap_now:.2f} or the 2-bar high {two_bar_high:.2f}", open_position_quotes)
         return None
 
     def _check_sweep_exits(
@@ -681,13 +755,16 @@ class OptionsOrderExecutor:
 
     def _close(
         self, symbol, existing: OpenOptionPosition, now, open_order_symbols, reason,
-        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None,
+        open_position_quotes: Optional[Dict[str, "OptionContract"]] = None, quantity: Optional[int] = None,
     ) -> OptionsExecutionRecord:
+        """`quantity` < existing.quantity = a PARTIAL close (ORB target leg);
+        default closes the whole position."""
+        qty = existing.quantity if quantity is None else max(1, min(quantity, existing.quantity))
         check = self.duplicate_guard.check(symbol, now, open_order_symbols)
         if not check.ok:
-            return OptionsExecutionRecord(symbol, "close", existing.option_type, existing.quantity, False, None, check.reason)
+            return OptionsExecutionRecord(symbol, "close", existing.option_type, qty, False, None, check.reason)
 
-        logger.info("%s: closing %d %s contract(s) -- %s", symbol, existing.quantity, existing.option_type, reason)
+        logger.info("%s: closing %d of %d %s contract(s) -- %s", symbol, qty, existing.quantity, existing.option_type, reason)
 
         # Fetched before the live/dry-run branch below so the trade log gets
         # a real estimated exit notional either way -- a dry-run entry with
@@ -708,7 +785,7 @@ class OptionsOrderExecutor:
                 "no usable quote to close this position -- refusing to submit a close order with no limit price",
             )
 
-        exit_notional = limit_price * existing.quantity * 100
+        exit_notional = limit_price * qty * 100
 
         if self._agent_mode:
             # Can't place the order or write trade_log.jsonl here -- no
@@ -718,11 +795,11 @@ class OptionsOrderExecutor:
             # evaluate_for_agent.py's `record` mode. Everything the agent
             # needs to do that is in pending_action.
             return OptionsExecutionRecord(
-                symbol, "close", existing.option_type, existing.quantity, False, None, None,
+                symbol, "close", existing.option_type, qty, False, None, None,
                 pending_action={
                     "type": "close", "option_type": existing.option_type,
                     "expiration_date": existing.expiration_date.isoformat(), "strike_price": existing.strike_price,
-                    "side": "sell", "position_effect": "close", "quantity": existing.quantity,
+                    "side": "sell", "position_effect": "close", "quantity": qty,
                     "limit_price": limit_price, "notional": exit_notional, "reason": reason,
                 },
             )
@@ -732,16 +809,16 @@ class OptionsOrderExecutor:
             order_id = self.broker.place_option_order(
                 symbol=symbol, option_type=existing.option_type, expiration_date=existing.expiration_date.isoformat(),
                 strike_price=existing.strike_price, side="sell", position_effect="close",
-                quantity=existing.quantity, limit_price=limit_price,
+                quantity=qty, limit_price=limit_price,
             )
             self.duplicate_guard.record_submitted(symbol, now)
 
         append_entry(TradeLogEntry(
             event="close", timestamp=now.isoformat(), symbol=symbol, asset_type="option",
-            trade_type=existing.option_type, quantity=existing.quantity, price=limit_price,
+            trade_type=existing.option_type, quantity=qty, price=limit_price,
             notional=exit_notional, dry_run=not self.live_trading_enabled, order_id=order_id, reason=reason,
         ), path=self.trade_log_path)
-        return OptionsExecutionRecord(symbol, "close", existing.option_type, existing.quantity, self.live_trading_enabled, order_id, None)
+        return OptionsExecutionRecord(symbol, "close", existing.option_type, qty, self.live_trading_enabled, order_id, None)
 
     def _open(self, symbol, current_price: float, wanted_type, decision: OptionsDecision, equity, current_total_premium_at_risk, buying_power, now, open_order_symbols) -> OptionsExecutionRecord:
         contract = self.chain_fetcher.get_atm_contract(symbol, wanted_type, current_price, self.dte_min, self.dte_max)

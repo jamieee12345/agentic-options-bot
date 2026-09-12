@@ -188,6 +188,16 @@ class OptionsConfig:
     max_chase_atr: float
     opening_range_minutes: int
     htf_gap_lookback_bars: int
+    # ORB model (brain/orb_strategy.py) + protection gates that apply to every model
+    time_stop: str
+    max_open_positions: int
+    weekly_loss_limit_pct: float
+    orb_minutes: int
+    orb_volume_multiplier: float
+    orb_volume_lookback: int
+    orb_atr_period: int
+    orb_target_r: float
+    orb_breakout_lookback_bars: int
     # No longer live exit triggers -- see orchestration/options_execution.py's
     # _check_trend_invalidation, which replaced both with a single
     # trend-based exit (re-checks the same hard-veto checks that gated
@@ -274,8 +284,20 @@ class OptionsConfig:
             raise ConfigError(f"a check can't be both hard and soft: {sorted(overlap)}")
         if not self.confluence_soft_checks:
             raise ConfigError("options.confluence_soft_checks must name at least one check")
-        if self.model not in ("sweep", "confluence"):
-            raise ConfigError(f"options.model ({self.model!r}) must be 'sweep' or 'confluence'")
+        if self.model not in ("sweep", "confluence", "orb"):
+            raise ConfigError(f"options.model ({self.model!r}) must be 'sweep', 'confluence' or 'orb'")
+        v = self.time_stop
+        if not (isinstance(v, str) and len(v) == 5 and v[2] == ":" and v[:2].isdigit() and v[3:].isdigit()):
+            raise ConfigError(f"options.time_stop ({v!r}) must be 'HH:MM' (ET)")
+        if self.max_open_positions < 0:
+            raise ConfigError("options.max_open_positions must be >= 0 (0 = unlimited)")
+        if not (0 <= self.weekly_loss_limit_pct < 1):
+            raise ConfigError("options.weekly_loss_limit_pct must be in [0, 1) (0 = off)")
+        for label in ("orb_minutes", "orb_volume_lookback", "orb_atr_period", "orb_breakout_lookback_bars"):
+            if getattr(self, label) <= 0:
+                raise ConfigError(f"options.{label} must be positive")
+        if self.orb_volume_multiplier <= 0 or self.orb_target_r <= 0:
+            raise ConfigError("options.orb_volume_multiplier and orb_target_r must be positive")
         for label in ("entry_session_start", "entry_session_end"):
             v = getattr(self, label)
             if not (isinstance(v, str) and len(v) == 5 and v[2] == ":" and v[:2].isdigit() and v[3:].isdigit()):
@@ -309,6 +331,15 @@ class OptionsConfig:
         if self.max_hold_days <= 0:
             raise ConfigError(f"options.max_hold_days ({self.max_hold_days}) must be positive")
 
+
+    def orb_config(self):
+        """The brain/orb_strategy.OrbConfig this config describes."""
+        from brain.orb_strategy import OrbConfig
+        return OrbConfig(
+            orb_minutes=self.orb_minutes, volume_multiplier=self.orb_volume_multiplier, volume_lookback=self.orb_volume_lookback,
+            atr_period=self.orb_atr_period, target_r=self.orb_target_r, breakout_lookback_bars=self.orb_breakout_lookback_bars,
+            max_chase_atr=self.max_chase_atr,
+        )
 
     def sweep_config(self):
         """The brain/sweep_strategy.SweepConfig this config describes."""

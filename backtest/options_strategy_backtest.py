@@ -80,6 +80,7 @@ from backtest.options_pricing import black_scholes_price, realized_volatility
 from brain.confluence import evaluate_confluence
 from brain.options_strategy import OptionsDecision, decide_options_action
 from brain.sweep_strategy import decide_sweep_action
+from brain.orb_strategy import decide_orb_action, session_vwap, todays_bars
 from orchestration.market_hours import MARKET_TZ
 from config.config_loader import Settings, load_settings
 from data.fetchers import YFinanceHistoricalFetcher
@@ -114,6 +115,10 @@ class SimulatedTrade:
     invalidation_price: Optional[float] = None
     target_price: Optional[float] = None
 
+    # ORB model: premium at which the first half was taken at target_r
+    # (None = no partial). pnl_pct then averages the two legs.
+    partial_exit_premium: Optional[float] = None
+
     @property
     def size_weight(self) -> float:
         """Half-size trades count half in pooled P&L (conviction 0.5)."""
@@ -127,6 +132,8 @@ class SimulatedTrade:
     def pnl_pct(self) -> Optional[float]:
         if not self.is_closed or self.entry_premium <= 0:
             return None
+        if self.partial_exit_premium is not None:
+            return 0.5 * (self.partial_exit_premium / self.entry_premium - 1) + 0.5 * (self.exit_premium / self.entry_premium - 1)
         return self.exit_premium / self.entry_premium - 1
 
 
@@ -618,6 +625,122 @@ def run_symbol_backtest_sweep(
     return result
 
 
+def run_symbol_backtest_orb(
+    symbol: str,
+    intraday_bars: pd.DataFrame,
+    daily_bars: pd.DataFrame,
+    settings: Settings,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    warmup_bars: int = DEFAULT_INTRADAY_WARMUP_BARS,
+    hourly_bars: Optional[pd.DataFrame] = None,
+    four_hour_bars: Optional[pd.DataFrame] = None,
+    decision_hook: Optional[Callable[[pd.Timestamp, OptionsDecision], None]] = None,
+) -> SymbolBacktestResult:
+    """Walk-forward of the ORB model (brain/orb_strategy.py), mirroring
+    orchestration/options_execution.py's orb-mode rules: entries only in
+    the entry session, protection gates, exits time_stop -> stop_hit ->
+    target partial (half at target_r x R, modelled as averaging two legs)
+    -> trail (VWAP / 2-bar) -> and the generic max_hold/expiration
+    backstops. Always flat by time_stop, so DTE only affects pricing."""
+    opt = settings.options
+    cfg = opt.orb_config()
+    result = SymbolBacktestResult(symbol=symbol)
+    open_trade: Optional[SimulatedTrade] = None
+    partial_taken = False
+    last_date = None
+    daily_window = daily_bars.iloc[:0]
+    entries_today = 0
+    day_pnl = 0.0
+    equity_units = 1.0 / max(opt.max_premium_pct_per_trade, 1e-9)
+
+    for i in range(warmup_bars, len(intraday_bars)):
+        window = intraday_bars.iloc[max(0, i + 1 - INTRADAY_WINDOW_BARS): i + 1]
+        bar_ts = intraday_bars.index[i]
+        et = bar_ts.tz_convert(MARKET_TZ) if bar_ts.tzinfo is not None else bar_ts.tz_localize("UTC").tz_convert(MARKET_TZ)
+        current_date = et.date()
+        hhmm = et.strftime("%H:%M")
+        spot = float(intraday_bars["close"].iloc[i])
+        result.bars_evaluated += 1
+        just_closed_this_bar = False
+
+        if current_date != last_date:
+            daily_window = daily_bars[daily_bars.index.date < current_date]
+            last_date = current_date
+            entries_today, day_pnl = 0, 0.0
+
+        def _close_trade(reason: str, premium: Optional[float] = None):
+            nonlocal open_trade, just_closed_this_bar, day_pnl, partial_taken
+            open_trade.exit_date, open_trade.exit_reason = current_date, reason
+            open_trade.exit_premium = premium if premium is not None else _price_position(open_trade, spot, current_date, risk_free_rate)
+            result.trades.append(open_trade)
+            if open_trade.pnl_pct is not None:
+                day_pnl += open_trade.pnl_pct * open_trade.size_weight
+            open_trade, just_closed_this_bar, partial_taken = None, True, False
+
+        if open_trade is not None:
+            is_call = open_trade.option_type == "call"
+            if hhmm >= opt.time_stop:
+                _close_trade("time_stop")
+            elif (current_date - open_trade.entry_date).days >= opt.max_hold_days:
+                _close_trade("max_hold")
+            elif (open_trade.expiration_date - current_date).days <= opt.close_before_expiration_days:
+                _close_trade("expiration")
+            elif open_trade.invalidation_price is not None and ((is_call and spot < open_trade.invalidation_price) or (not is_call and spot > open_trade.invalidation_price)):
+                _close_trade("stop_hit")
+            elif open_trade.target_price is not None and not partial_taken and ((is_call and spot >= open_trade.target_price) or (not is_call and spot <= open_trade.target_price)):
+                open_trade.partial_exit_premium = _price_position(open_trade, spot, current_date, risk_free_rate)
+                partial_taken = True
+            elif partial_taken:
+                todays = todays_bars(window, bar_ts.to_pydatetime())
+                if len(todays) >= 3:
+                    vwap_now = float(session_vwap(todays).iloc[-1])
+                    prior2 = todays.iloc[-3:-1]
+                    if is_call and (spot < vwap_now or spot < float(prior2["low"].min())):
+                        _close_trade("trail_exit")
+                    elif not is_call and (spot > vwap_now or spot > float(prior2["high"].max())):
+                        _close_trade("trail_exit")
+
+        in_session = opt.entry_session_start <= hhmm < opt.entry_session_end
+        loss_limited = opt.daily_loss_limit_pct > 0 and (day_pnl / equity_units) <= -opt.daily_loss_limit_pct
+        if not in_session or open_trade is not None or just_closed_this_bar or loss_limited:
+            continue
+        if opt.max_entries_per_day and entries_today >= opt.max_entries_per_day:
+            continue
+
+        decision = decide_orb_action(symbol, window, bar_ts.to_pydatetime(), cfg=cfg)
+        if decision.confluence_details.get("breakout") == "pass":
+            result.fvg_triggers += 1  # "triggers" = qualifying breakouts seen (repeats while it stays in the lookback)
+            if decision.action == "hold":
+                result.confluence_rejections += 1
+        if decision_hook is not None and decision.confluence_details:
+            decision_hook(bar_ts, decision)
+        if decision.action not in ("buy_call", "buy_put"):
+            continue
+
+        wanted_type = "call" if decision.action == "buy_call" else "put"
+        expiration = current_date + timedelta(days=_target_dte(settings))
+        iv = realized_volatility(daily_window) if len(daily_window) >= 2 else 0.20
+        try:
+            entry_premium = black_scholes_price(spot, spot, (expiration - current_date).days / 365, risk_free_rate, iv, wanted_type)
+        except ValueError:
+            continue
+        if entry_premium <= 0:
+            continue
+        open_trade = SimulatedTrade(
+            symbol=symbol, option_type=wanted_type, entry_date=current_date, entry_spot=spot, strike=spot,
+            expiration_date=expiration, entry_iv=iv, entry_premium=entry_premium,
+            gap_low=decision.gap_low, gap_high=decision.gap_high, entry_details=dict(decision.confluence_details),
+            tier=decision.tier, invalidation_price=decision.invalidation_price, target_price=decision.target_price,
+        )
+        partial_taken = False
+        result.trades_opened += 1
+        entries_today += 1
+
+    if open_trade is not None:
+        result.trades.append(open_trade)
+    return result
+
+
 @dataclass
 class BacktestReport:
     per_symbol: Dict[str, SymbolBacktestResult]
@@ -689,7 +812,7 @@ def run_backtest_intraday(
         daily_bars = fetcher.get_bars(symbol, daily_start.isoformat(), end.isoformat(), timeframe="1D")
         hourly_bars = fetcher.get_bars(symbol, hourly_start.isoformat(), end.isoformat(), timeframe="1h")
         four_hour_bars = resample_ohlcv(hourly_bars, "4h", offset="9h30min")
-        walk = run_symbol_backtest_sweep if settings.options.model == "sweep" else run_symbol_backtest_intraday
+        walk = {"sweep": run_symbol_backtest_sweep, "orb": run_symbol_backtest_orb}.get(settings.options.model, run_symbol_backtest_intraday)
         result = walk(
             symbol, intraday_bars, daily_bars, settings, hourly_bars=hourly_bars, four_hour_bars=four_hour_bars,
         )

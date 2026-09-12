@@ -28,7 +28,7 @@ existing.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import replace, asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -149,6 +149,9 @@ class OpenTrade:
     invalidation_price: Optional[float] = None
     target_price: Optional[float] = None
     tier: Optional[str] = None  # "full" / "half"
+    # ORB model: True once a partial (the target_r leg) has been taken, so
+    # the executor trails the remainder instead of re-taking the target.
+    partial_taken: bool = False
 
 
 def build_trade_history(entries: List[TradeLogEntry]) -> "tuple[List[ClosedTrade], List[OpenTrade]]":
@@ -159,15 +162,30 @@ def build_trade_history(entries: List[TradeLogEntry]) -> "tuple[List[ClosedTrade
         if entry.event == "open":
             pending[entry.symbol] = entry
         elif entry.event == "close":
-            open_entry = pending.pop(entry.symbol, None)
+            open_entry = pending.get(entry.symbol)
             if open_entry is None:
                 continue  # a close with no matching open in this log (e.g. log started after the position was already open) -- can't compute P&L for it, skip
-            pnl_dollars = entry.notional - open_entry.notional
-            pnl_pct = (pnl_dollars / open_entry.notional) if open_entry.notional > 0 else None
+            # A PARTIAL close (fewer contracts than are open) realizes P&L on
+            # that slice and leaves the remainder open, flagged partial_taken
+            # -- the ORB model's target leg. Anything else closes the lot.
+            partial = 0 < entry.quantity < open_entry.quantity
+            if partial:
+                frac = entry.quantity / open_entry.quantity
+                slice_notional = open_entry.notional * frac
+                pending[entry.symbol] = replace(
+                    open_entry, quantity=open_entry.quantity - entry.quantity, notional=open_entry.notional - slice_notional,
+                    reason="partial_taken",
+                )
+                closed_qty, entry_notional_used = entry.quantity, slice_notional
+            else:
+                pending.pop(entry.symbol, None)
+                closed_qty, entry_notional_used = open_entry.quantity, open_entry.notional
+            pnl_dollars = entry.notional - entry_notional_used
+            pnl_pct = (pnl_dollars / entry_notional_used) if entry_notional_used > 0 else None
             closed.append(ClosedTrade(
                 symbol=entry.symbol, asset_type=entry.asset_type, trade_type=open_entry.trade_type,
-                quantity=open_entry.quantity, opened_at=open_entry.timestamp, closed_at=entry.timestamp,
-                entry_notional=open_entry.notional, exit_notional=entry.notional, pnl_dollars=pnl_dollars,
+                quantity=closed_qty, opened_at=open_entry.timestamp, closed_at=entry.timestamp,
+                entry_notional=entry_notional_used, exit_notional=entry.notional, pnl_dollars=pnl_dollars,
                 pnl_pct=pnl_pct, close_reason=entry.reason, dry_run=entry.dry_run,
                 strike_price=open_entry.strike_price, expiration_date=open_entry.expiration_date,
                 dte_at_entry=open_entry.dte_at_entry, bid=open_entry.bid, ask=open_entry.ask,
@@ -182,6 +200,7 @@ def build_trade_history(entries: List[TradeLogEntry]) -> "tuple[List[ClosedTrade
             bid=e.bid, ask=e.ask, spread_pct=e.spread_pct, confluence_score=e.confluence_score,
             confluence_applicable=e.confluence_applicable, confluence_details=e.confluence_details,
             invalidation_price=e.invalidation_price, target_price=e.target_price, tier=e.tier,
+            partial_taken=(e.reason == "partial_taken"),
         )
         for e in pending.values()
     ]
