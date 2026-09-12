@@ -383,6 +383,8 @@ class OptionsOrderExecutor:
                         hourly_bars=(hourly_bars or {}).get(symbol), four_hour_bars=(four_hour_bars or {}).get(symbol),
                         cfg=self.sweep_config,
                     )
+            elif entries_blocked is not None:
+                decision = OptionsDecision(symbol, "hold", 0.0, f"no new entries: {entries_blocked}")
             else:
                 decision = decide_options_action(
                     symbol, symbol_bars, self.fvg_lookback_period, self.fvg_body_multiplier, self.fvg_volume_multiplier,

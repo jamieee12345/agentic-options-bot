@@ -145,19 +145,30 @@ options:
   # (brain/sweep_strategy.py). Replaces the multi-indicator confluence gate
   # after per-indicator attribution showed it rejecting ~90% of triggers
   # for no measurable edge, and after two live dry-run days with zero
-  # entries. "confluence" = the original gate (kept for comparison only).
-  model: sweep
+  # entries. "confluence" = the FVG + confluence gate.
+  #
+  # 2026-09-11 decision: "confluence" runs live. Same 58-day/10-symbol
+  # window, one validation each: lean confluence policy (the check set
+  # below) PF 2.436 on 39 trades; sweep PF 0.68 on 24 trades (median
+  # target/stop ratio 1.01, three -100% overnight max_hold exits --
+  # structural, not tunable). "orb" (opening-range breakout) is being
+  # built as a third selectable model and must beat this on the same
+  # window before it goes live. One window, theoretical prices, no costs
+  # -- treat 2.4 as "first thing above 1.0", not a promise.
+  model: confluence
 
-  # Entries only inside this ET window ("Trade your session"). Outside it
-  # every cycle still manages exits. The hourly routine can't watch a
+  # Entries only inside this ET window ("Trade your session") -- applies to
+  # the sweep/orb models; the confluence model trades the whole session
+  # as it was validated. Outside it every cycle still manages exits. The hourly routine can't watch a
   # one-hour window on its own, so extra routines fire at ~9:40/9:55/
   # 10:10/10:25 ET during the session.
   entry_session_start: "09:30"
   entry_session_end: "10:30"
 
-  # Account protection for NEW entries (exits are never blocked):
-  # at most this many entries per ET day, and none once the day's realized
-  # + unrealized P&L is at or below -daily_loss_limit_pct x equity.
+  # Account protection for NEW entries, applied to EVERY model (exits are
+  # never blocked): at most this many entries per ET day, and none once
+  # the day's realized + unrealized P&L is at or below
+  # -daily_loss_limit_pct x equity.
   # Sizing is fixed-fraction (max_premium_pct_per_trade x conviction), so a
   # win never sizes up the next trade and a loss never sizes down.
   max_entries_per_day: 2
