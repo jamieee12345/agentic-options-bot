@@ -1,0 +1,59 @@
+# Publishes the dashboard + daily journals to GitHub Pages on every push.
+#
+# The cloud routines commit trade_log.jsonl / activity_log.jsonl /
+# equity_history.jsonl / account_snapshot.json / market_data/ after every
+# cycle and reports/ after the daily journal, so every push here is a new
+# snapshot of bot state. This workflow renders that state once
+# (dashboard/live_account_dashboard.py --once) and deploys the result, which
+# is what makes the dashboard reachable from any device at a fixed URL:
+#   https://jamieee12345.github.io/agentic-options-bot/
+#
+# Read-only by construction: no broker credentials, no MCP, no .env -- the
+# build only reads files already committed to the repo.
+name: Publish dashboard
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# During the opening-session loop a push lands every ~5 minutes; only the
+# newest build matters, so cancel any older one still queued.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Turns Pages on for the repo the first time this runs; a no-op after.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build site
+        run: python scripts/build_site.py site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
