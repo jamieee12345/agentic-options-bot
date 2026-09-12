@@ -1077,7 +1077,7 @@ def _git_pull() -> None:
 
 def _strategy_summary(settings) -> Dict[str, str]:
     o = settings.options
-    session = "whole session" if o.model == "confluence" else f"{o.entry_session_start}-{o.entry_session_end} ET"
+    session = f"{o.entry_session_start}-{o.entry_session_end} ET (exits managed all day)"
     model_desc = {
         "confluence": "FVG + lean confluence (1h/4h trend + structure hard; volume profile / 200-SMA / S-R soft)",
         "sweep": "liquidity sweep -> displacement gap",

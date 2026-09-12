@@ -157,9 +157,12 @@ options:
   # -- treat 2.4 as "first thing above 1.0", not a promise.
   model: confluence
 
-  # Entries only inside this ET window ("Trade your session") -- applies to
-  # the sweep/orb models; the confluence model trades the whole session
-  # as it was validated. Outside it every cycle still manages exits. The hourly routine can't watch a
+  # Entries only inside this ET window ("Trade your session"), for EVERY
+  # model -- the first hour is where structure is cleanest and displacement
+  # is largest (user's call, 2026-09-11). Outside it every cycle still
+  # manages exits, so a 10:15 entry is looked after until it closes.
+  # NOTE: the confluence model's 2.436 was measured trading the whole day;
+  # the session-restricted variant is re-validated separately. The hourly routine can't watch a
   # one-hour window on its own, so extra routines fire at ~9:40/9:55/
   # 10:10/10:25 ET during the session.
   entry_session_start: "09:30"

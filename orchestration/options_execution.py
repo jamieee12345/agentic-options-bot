@@ -259,8 +259,8 @@ class OptionsOrderExecutor:
         # of fvg_invalidated / trend_invalidated.
         self.model = model
         self.sweep_config = sweep_config or SweepConfig()
-        # Entry-only session window in ET ("HH:MM", "HH:MM"); outside it a
-        # cycle only manages exits. None = entries allowed any time.
+        # Entry-only session window in ET ("HH:MM", "HH:MM") for EVERY model;
+        # outside it a cycle only manages exits. None = entries any time.
         self.entry_session = entry_session
         # Account protection (both 0 = off): no new entries once this many
         # have been opened today, or once today's realized + unrealized
@@ -409,6 +409,8 @@ class OptionsOrderExecutor:
                     decision = OptionsDecision(symbol, "hold", 0.0, f"no new entries: {entries_blocked}")
                 else:
                     decision = decide_orb_action(symbol, symbol_bars, now, cfg=self.orb_config)
+            elif not self._in_entry_session(now):
+                decision = OptionsDecision(symbol, "hold", 0.0, f"outside the entry session ({self.entry_session[0]}-{self.entry_session[1]} ET) -- managing exits only")
             elif entries_blocked is not None:
                 decision = OptionsDecision(symbol, "hold", 0.0, f"no new entries: {entries_blocked}")
             else:

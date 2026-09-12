@@ -448,6 +448,11 @@ def run_symbol_backtest_intraday(
                 result.trades.append(open_trade)
                 open_trade, just_closed_this_bar = None, True
 
+        # Same entry-session gate as the executor (exits above are unaffected).
+        et = bar_ts.tz_convert(MARKET_TZ) if bar_ts.tzinfo is not None else bar_ts.tz_localize("UTC").tz_convert(MARKET_TZ)
+        if not (opt.entry_session_start <= et.strftime("%H:%M") < opt.entry_session_end):
+            continue
+
         decision = decide_options_action(
             symbol, window, opt.fvg_lookback_period, opt.fvg_body_multiplier, opt.fvg_volume_multiplier,
             opt.sma_period, opt.min_confluence_score,
