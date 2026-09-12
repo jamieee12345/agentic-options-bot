@@ -112,8 +112,24 @@ options:
   # overnight." target_dte_min=1 is now usable (it wasn't before) because
   # close_before_expiration_days dropped to 0 at the same time -- see that
   # field's comment for why the two changed together.
-  target_dte_min: 1
-  target_dte_max: 2
+  # ---- 0DTE TEST (dry-run), Monday 2026-09-14, on request -----------------
+  # The normal floor is 1 DTE (MIN_ALLOWED_DTE in config_loader.py).
+  # allow_0dte: true is the explicit, visible opt-out of that floor for a
+  # named dry-run test: "see what it can handle for 0DTE". Only SPY/QQQ
+  # list same-day expirations on a Monday; the eight stocks will journal
+  # "no expiration within 0-0 DTE" via `note`, which is itself part of the
+  # test. Backtest (58d, same 17 entries): 1-2 DTE P(win) 47%, +104%/-27%,
+  # PF 3.46; 0DTE P(win) 47%, +261%/-51%, PF 4.51 -- same odds, ~2.5x the
+  # swing, 4 of 17 lost >50%. To return to the validated live config:
+  # allow_0dte: false, target_dte_min: 1, target_dte_max: 2.
+  allow_0dte: true
+  target_dte_min: 0
+  target_dte_max: 0
+  # On the expiration boundary day, force-close at the first cycle at/after
+  # this ET time. With cycles at ~:07 past the hour, "15:00" means the
+  # 3:07pm cycle closes a 0DTE position -- the last look before the 4pm
+  # expiry. (For 1-2 DTE this never binds: max_hold closes next morning.)
+  expiration_day_close_time: "15:00"
 
   # Force-close any open options position once it's ON its expiration day
   # (0 = same-day, not "1 day before" as it was under the old 2-7 DTE

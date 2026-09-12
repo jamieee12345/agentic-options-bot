@@ -226,6 +226,7 @@ class OptionsOrderExecutor:
         time_stop: Optional[str] = None,
         max_open_positions: int = 0,
         weekly_loss_limit_pct: float = 0.0,
+        expiration_day_close_time: str = "15:00",
         live_trading_enabled: bool = False,
         duplicate_guard: Optional[DuplicateOrderGuard] = None,
         trade_log_path: Path = DEFAULT_LOG_PATH,
@@ -277,6 +278,10 @@ class OptionsOrderExecutor:
         self.time_stop = time_stop
         self.max_open_positions = max_open_positions
         self.weekly_loss_limit_pct = weekly_loss_limit_pct
+        # On the expiration boundary day, force-close at the first cycle at/
+        # after this ET time (not at the day's first cycle) -- lets a 0DTE
+        # position trade its session while still closing before expiry.
+        self.expiration_day_close_time = expiration_day_close_time
         # "Close if going nowhere" -- see the class/module docstrings for
         # why. Only ever reached after trend invalidation didn't already
         # fire this bar (see _check_stagnation_exit).
@@ -354,8 +359,11 @@ class OptionsOrderExecutor:
                         ))
                         continue
 
-                if (existing.expiration_date - now.date()).days <= self.close_before_expiration_days:
-                    records.append(self._close(symbol, existing, now, open_order_symbols, "approaching expiration -- forced close", open_position_quotes))
+                days_left = (existing.expiration_date - now.date()).days
+                on_boundary_day = days_left == self.close_before_expiration_days
+                past_close_time = now.astimezone(MARKET_TZ).strftime("%H:%M") >= self.expiration_day_close_time
+                if days_left < self.close_before_expiration_days or (on_boundary_day and past_close_time):
+                    records.append(self._close(symbol, existing, now, open_order_symbols, f"approaching expiration -- forced close ({days_left} DTE, at/after {self.expiration_day_close_time} ET on the boundary day)", open_position_quotes))
                     continue
 
                 if self.model == "sweep":

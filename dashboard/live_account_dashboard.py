@@ -1087,7 +1087,7 @@ def _strategy_summary(settings) -> Dict[str, str]:
         "live_trading_enabled": "true" if settings.broker.live_trading_enabled else "false",
         "model": f"{o.model} -- {model_desc}",
         "entries": session,
-        "DTE": f"{o.target_dte_min}-{o.target_dte_max}",
+        "DTE": f"{o.target_dte_min}-{o.target_dte_max}" + (" (0DTE TEST -- allow_0dte on)" if o.allow_0dte and o.target_dte_min == 0 else ""),
         "max hold": f"{o.max_hold_days} day",
         "per trade": f"{o.max_premium_pct_per_trade:.0%} of equity",
         "gates": f"{o.max_entries_per_day}/day, {o.max_open_positions} open, day -{o.daily_loss_limit_pct:.0%}, week -{o.weekly_loss_limit_pct:.0%}",

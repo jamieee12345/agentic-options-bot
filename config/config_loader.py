@@ -143,6 +143,15 @@ class OptionsConfig:
     target_dte_min: int
     target_dte_max: int
     close_before_expiration_days: int
+    # EXPLICIT opt-in to same-day-expiring (0DTE) contracts. Default false:
+    # the MIN_ALLOWED_DTE floor applies. Set true only for a deliberate,
+    # named test -- it removes a safety rule. See settings.yaml.
+    allow_0dte: bool
+    # On the expiration boundary day (days-to-expiry == close_before_
+    # expiration_days) a position is force-closed at the first cycle AT or
+    # AFTER this ET time, not at the first cycle of the day -- so a 0DTE
+    # position actually gets its session and is still closed before expiry.
+    expiration_day_close_time: str
     max_premium_pct_per_trade: float
     max_total_premium_pct_of_equity: float
     fvg_lookback_period: int
@@ -233,21 +242,29 @@ class OptionsConfig:
     max_hold_days: int
 
     def __post_init__(self) -> None:
-        if self.target_dte_min < MIN_ALLOWED_DTE:
+        if self.target_dte_min < MIN_ALLOWED_DTE and not self.allow_0dte:
             raise ConfigError(
                 f"options.target_dte_min ({self.target_dte_min}) must be >= {MIN_ALLOWED_DTE} -- "
-                f"0DTE (same-day expiration) trades are never permitted"
+                f"0DTE (same-day expiration) trades are not permitted unless options.allow_0dte is true"
             )
-        if self.target_dte_min >= self.target_dte_max:
+        if self.target_dte_min < 0:
+            raise ConfigError("options.target_dte_min must be >= 0")
+        v = self.expiration_day_close_time
+        if not (isinstance(v, str) and len(v) == 5 and v[2] == ":" and v[:2].isdigit() and v[3:].isdigit()):
+            raise ConfigError(f"options.expiration_day_close_time ({v!r}) must be 'HH:MM' (ET)")
+        if self.target_dte_min > self.target_dte_max:
             raise ConfigError(
                 f"options.target_dte_min ({self.target_dte_min}) must be < target_dte_max ({self.target_dte_max})"
             )
         if self.close_before_expiration_days < 0:
             raise ConfigError(f"options.close_before_expiration_days ({self.close_before_expiration_days}) must be non-negative")
-        if self.close_before_expiration_days >= self.target_dte_min:
+        # Equal is allowed: on the boundary day the force-close waits until
+        # expiration_day_close_time, so a position opened that morning still
+        # gets its session (this is what makes a 0DTE test possible at all).
+        if self.close_before_expiration_days > self.target_dte_min:
             raise ConfigError(
-                f"options.close_before_expiration_days ({self.close_before_expiration_days}) must be < "
-                f"target_dte_min ({self.target_dte_min}) -- otherwise a freshly opened position could already be inside its own force-close window"
+                f"options.close_before_expiration_days ({self.close_before_expiration_days}) must be <= "
+                f"target_dte_min ({self.target_dte_min}) -- otherwise a freshly opened position would already be inside its own force-close window"
             )
         if not (0 < self.max_premium_pct_per_trade <= 1.0):
             raise ConfigError(f"options.max_premium_pct_per_trade ({self.max_premium_pct_per_trade}) must be in (0, 1]")

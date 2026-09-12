@@ -429,7 +429,7 @@ def run_symbol_backtest_intraday(
             # the first bar of that day; ON the boundary day itself, close
             # into the final minutes (3:55pm ET) rather than at the open, so
             # a same-day-expiring (0DTE) position actually gets its session.
-            if days_left < opt.close_before_expiration_days or (days_left == opt.close_before_expiration_days and hhmm_et >= "15:55"):
+            if days_left < opt.close_before_expiration_days or (days_left == opt.close_before_expiration_days and hhmm_et >= opt.expiration_day_close_time):
                 open_trade.exit_date, open_trade.exit_reason = current_date, "expiration"
                 open_trade.exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 result.trades.append(open_trade)
@@ -467,7 +467,8 @@ def run_symbol_backtest_intraday(
             pnl_pct = (current_value / open_trade.entry_premium) - 1 if open_trade.entry_premium > 0 else 0
             dte_at_entry = (open_trade.expiration_date - open_trade.entry_date).days
             days_held = (current_date - open_trade.entry_date).days
-            if days_held >= opt.stagnant_exit_hold_fraction * dte_at_entry and pnl_pct < opt.stagnant_exit_min_pnl_pct:
+            # dte_at_entry == 0 (0DTE): the fraction-of-DTE rule is meaningless -- the executor skips it too
+            if dte_at_entry > 0 and days_held >= opt.stagnant_exit_hold_fraction * dte_at_entry and pnl_pct < opt.stagnant_exit_min_pnl_pct:
                 open_trade.exit_date, open_trade.exit_reason = current_date, "stagnant"
                 open_trade.exit_premium = current_value
                 result.trades.append(open_trade)
