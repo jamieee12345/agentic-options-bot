@@ -945,8 +945,6 @@ def render_html(snapshot: DashboardSnapshot, refresh_seconds: int, account_label
     <span class="sep">&middot;</span>
     <span>updated {snapshot.fetched_at.strftime('%H:%M:%S UTC')}</span>
     <span class="ro-badge">read-only &middot; places no orders</span>
-    <span class="sep">&middot;</span>
-    <a href="journals/" style="color:inherit">daily journals</a>
   </div>
 </header>
 <nav class="topnav">
@@ -1103,10 +1101,9 @@ def run_forever(
 ) -> None:
     """Render the dashboard on a loop -- or exactly once when ``once`` is set.
 
-    ``once`` exists for the GitHub Pages build (.github/workflows/pages.yml):
-    CI renders one HTML file from the freshly pushed logs and publishes it,
-    so there is nothing to loop over and no repo to pull. Everything else is
-    identical to the local watch mode."""
+    ``once`` exists for publishing a snapshot elsewhere (e.g. as a private
+    Claude artifact on request): render one HTML file from the current repo
+    state and exit. Everything else is identical to the local watch mode."""
     # Settings loaded here only for stop_loss_pct/take_profit_pct, which
     # orchestration/trade_grading.py needs to bucket a closed trade's P&L
     # into "clean win"/"small loss"/etc against THIS account's actual
@@ -1172,7 +1169,7 @@ if __name__ == "__main__":
     parser.add_argument("--refresh-seconds", type=int, default=DEFAULT_REFRESH_SECONDS)
     parser.add_argument("--settings", default="config/settings.yaml")
     parser.add_argument("--no-pull", action="store_true", help="Don't auto `git pull` each cycle -- just re-read whatever's on disk")
-    parser.add_argument("--once", action="store_true", help="Render one HTML file and exit (used by the GitHub Pages build); implies --no-pull")
+    parser.add_argument("--once", action="store_true", help="Render one HTML file and exit; implies --no-pull")
     args = parser.parse_args()
     run_forever(
         Path(args.output), args.refresh_seconds, args.settings,
