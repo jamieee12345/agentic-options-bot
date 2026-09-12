@@ -74,10 +74,11 @@ MCP routine's cadence), there's little reason to go much tighter than this.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable, Dict, List, Optional
@@ -159,6 +160,11 @@ class DashboardSnapshot:
     trade_grades: List[Optional[TradeGrade]]         # same order/length as trade_history -- orchestration/trade_grading.py's per-trade grade
     check_performance: List[CheckPerformance]        # empty until MIN_TRADES_FOR_AGGREGATE closed trades exist
     error: Optional[str] = None  # set instead of raising, so one bad cycle doesn't kill the loop
+    # What the bot is configured to do right now (from settings.yaml): the
+    # entry model, its session window, the protection gates, the DTE window
+    # and the dry-run/live switch -- shown in a strip under the header so
+    # the dashboard says which strategy produced what it shows.
+    strategy: Dict[str, str] = field(default_factory=dict)
 
 
 def _classify_activity(entries: List[ActivityEntry]) -> tuple[List[ActivityEntry], List[SymbolActivitySummary]]:
@@ -219,6 +225,7 @@ def fetch_snapshot(
     equity_history_path: Path = DEFAULT_EQUITY_HISTORY_PATH,
     snapshot_path: Path = DEFAULT_SNAPSHOT_PATH,
     watchlist: Optional[Iterable[str]] = None,
+    strategy: Optional[Dict[str, str]] = None,
 ) -> DashboardSnapshot:
     """Pure read of files the MCP routine already committed and pushed --
     see orchestration/account_snapshot.py's module docstring for why this
@@ -309,7 +316,7 @@ def fetch_snapshot(
         today_significant_events=significant_events[:30], today_symbol_summaries=symbol_summaries,
         live_reasoning=live_reasoning, news_by_symbol=news_by_symbol,
         trade_grades=trade_grades, check_performance=check_performance,
-        error=error,
+        error=error, strategy=strategy or {},
     )
 
 
@@ -706,6 +713,25 @@ def render_html(snapshot: DashboardSnapshot, refresh_seconds: int, account_label
         equity_delta = snapshot.equity_history[-1].equity - snapshot.equity_history[0].equity
     equity_delta_pct = (equity_delta / snapshot.equity_history[0].equity) if equity_delta is not None and snapshot.equity_history[0].equity else None
 
+    strat = snapshot.strategy or {}
+
+    if strat:
+
+        mode_cls = "live" if strat.get("live_trading_enabled") == "true" else "dry"
+
+        chips = "".join(f"<span class='chip'><b>{k}</b> {html.escape(str(v))}</span>" for k, v in strat.items() if k != "live_trading_enabled")
+
+        strategy_strip = (
+
+            f"<div class='strategy-strip'><span class='mode-badge {mode_cls}'>{'LIVE ORDERS' if mode_cls == 'live' else 'DRY RUN'}</span>{chips}</div>"
+
+        )
+
+    else:
+
+        strategy_strip = ""
+
+
     error_banner = (
         f"<div class='banner off'><div class='title'>Last refresh had an error</div><div>{snapshot.error}</div>"
         f"<div class='foot'>Showing the most recently successful data below (if any) -- this file keeps retrying every cycle.</div></div>"
@@ -732,6 +758,12 @@ def render_html(snapshot: DashboardSnapshot, refresh_seconds: int, account_label
   }}
   h1 {{ font-size: 21px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }}
   .topbar {{ margin-bottom: 14px; }}
+  .strategy-strip {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 18px; padding: 10px 14px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; font-size: 12.5px; }}
+  .strategy-strip .chip {{ padding: 3px 9px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-2, inherit); }}
+  .strategy-strip .chip b {{ font-weight: 600; margin-right: 4px; opacity: .75; }}
+  .mode-badge {{ font-weight: 700; letter-spacing: .08em; padding: 3px 10px; border-radius: 6px; font-size: 11px; }}
+  .mode-badge.dry {{ background: rgba(255,180,0,.15); color: #e0a800; border: 1px solid rgba(255,180,0,.4); }}
+  .mode-badge.live {{ background: rgba(255,60,60,.15); color: #ff5c5c; border: 1px solid rgba(255,60,60,.4); }}
   .brand {{ display: flex; align-items: center; gap: 10px; }}
   .brand-mark {{
     width: 26px; height: 26px; border-radius: 7px; flex-shrink: 0;
@@ -920,6 +952,7 @@ def render_html(snapshot: DashboardSnapshot, refresh_seconds: int, account_label
   <a href="#activity">Activity</a><a href="#history">History</a><a href="#quality">Quality</a><a href="#positions">Positions</a>
 </nav>
 {error_banner}
+{strategy_strip}
 
 <div class="section" id="account">
   <div class="section-label">Account</div>
@@ -1042,6 +1075,26 @@ def _git_pull() -> None:
         logger.exception("git pull raised this cycle (non-fatal)")
 
 
+def _strategy_summary(settings) -> Dict[str, str]:
+    o = settings.options
+    session = "whole session" if o.model == "confluence" else f"{o.entry_session_start}-{o.entry_session_end} ET"
+    model_desc = {
+        "confluence": "FVG + lean confluence (1h/4h trend + structure hard; volume profile / 200-SMA / S-R soft)",
+        "sweep": "liquidity sweep -> displacement gap",
+        "orb": f"{o.orb_minutes}-min opening range breakout (vol >{o.orb_volume_multiplier}x, VWAP)",
+    }.get(o.model, o.model)
+    return {
+        "live_trading_enabled": "true" if settings.broker.live_trading_enabled else "false",
+        "model": f"{o.model} -- {model_desc}",
+        "entries": session,
+        "DTE": f"{o.target_dte_min}-{o.target_dte_max}",
+        "max hold": f"{o.max_hold_days} day",
+        "per trade": f"{o.max_premium_pct_per_trade:.0%} of equity",
+        "gates": f"{o.max_entries_per_day}/day, {o.max_open_positions} open, day -{o.daily_loss_limit_pct:.0%}, week -{o.weekly_loss_limit_pct:.0%}",
+        "watchlist": ", ".join(settings.broker.core_watchlist),
+    }
+
+
 def run_forever(
     output_path: Path = DEFAULT_OUTPUT_PATH, refresh_seconds: int = DEFAULT_REFRESH_SECONDS,
     settings_path: str = "config/settings.yaml", auto_pull: bool = True,
@@ -1079,7 +1132,7 @@ def run_forever(
         try:
             snapshot = fetch_snapshot(
                 settings.options.stop_loss_pct, settings.options.take_profit_pct, news_fetcher,
-                watchlist=settings.broker.core_watchlist,
+                watchlist=settings.broker.core_watchlist, strategy=_strategy_summary(settings),
             )
             last_good = snapshot
         except Exception as exc:
