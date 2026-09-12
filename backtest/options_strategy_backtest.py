@@ -404,6 +404,7 @@ def run_symbol_backtest_intraday(
         window = intraday_bars.iloc[max(0, i + 1 - INTRADAY_WINDOW_BARS): i + 1]
         bar_ts = intraday_bars.index[i]
         current_date = bar_ts.date() if hasattr(bar_ts, "date") else bar_ts
+        hhmm_et = (bar_ts.tz_convert(MARKET_TZ) if bar_ts.tzinfo is not None else bar_ts.tz_localize("UTC").tz_convert(MARKET_TZ)).strftime("%H:%M")
         spot = float(intraday_bars["close"].iloc[i])
         result.bars_evaluated += 1
         just_closed_this_bar = False
@@ -424,7 +425,11 @@ def run_symbol_backtest_intraday(
 
         if open_trade is not None:
             days_left = (open_trade.expiration_date - current_date).days
-            if days_left <= opt.close_before_expiration_days:
+            # "close_before_expiration_days" days before expiry -> close at
+            # the first bar of that day; ON the boundary day itself, close
+            # into the final minutes (3:55pm ET) rather than at the open, so
+            # a same-day-expiring (0DTE) position actually gets its session.
+            if days_left < opt.close_before_expiration_days or (days_left == opt.close_before_expiration_days and hhmm_et >= "15:55"):
                 open_trade.exit_date, open_trade.exit_reason = current_date, "expiration"
                 open_trade.exit_premium = _price_position_at(open_trade, spot, bar_ts, risk_free_rate)
                 result.trades.append(open_trade)
